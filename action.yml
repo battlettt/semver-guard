@@ -1,0 +1,82 @@
+name: semver-guard
+description: Fail the job when the exported API of a TypeScript package has breaking changes between two versions.
+author: semver-guard contributors
+branding:
+  icon: shield
+  color: orange
+
+# How the action finds its own checkout: for a composite action, the runner
+# sets $GITHUB_ACTION_PATH (the same value as ${{ github.action_path }}) to the
+# directory that contains this action.yml. For `uses: owner/semver-guard@v6`
+# that is the copy the runner downloaded under _actions/; for `uses: ./` it is
+# the workspace path the step points at. Dependencies are installed and the
+# CLI is built there from source on every run; no built dist/ is committed.
+#
+# Inputs reach the scripts only through `env:`, never by expanding
+# ${{ inputs.* }} inside `run:`, so input values cannot inject shell code.
+# src/action.ts maps them to the CLI arguments.
+
+inputs:
+  from:
+    description: Directory snapshot of the previous version (relative to working-directory). Set this or from-ref.
+    required: false
+    default: ''
+  to:
+    description: Directory snapshot of the new version (relative to working-directory). Set this or to-ref.
+    required: false
+    default: ''
+  from-ref:
+    description: Git tag, branch or commit of the previous version. Set this or from. The ref must be fetched (actions/checkout with fetch-depth 0).
+    required: false
+    default: ''
+  to-ref:
+    description: Git tag, branch or commit of the new version. Set this or to.
+    required: false
+    default: ''
+  baseline:
+    description: JSON file of accepted breaking changes to suppress (relative to working-directory).
+    required: false
+    default: ''
+  format:
+    description: Output format, "table" or "json".
+    required: false
+    default: table
+  working-directory:
+    description: Directory to run in, relative to the workspace. Git refs compare this directory at each ref (for a package in a monorepo).
+    required: false
+    default: '.'
+
+runs:
+  using: composite
+  steps:
+    - name: Check Node.js version
+      shell: bash
+      run: |
+        node -e '
+          const major = Number(process.versions.node.split(".")[0]);
+          if (major < 20) {
+            console.log(`::error title=semver-guard::semver-guard needs Node.js 20 or newer, found ${process.version}. Add actions/setup-node before this step.`);
+            process.exit(1);
+          }
+        '
+
+    - name: Build semver-guard from source
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        echo "::group::Install and build semver-guard in $GITHUB_ACTION_PATH"
+        npm ci --no-audit --no-fund
+        npm run build
+        echo "::endgroup::"
+
+    - name: Compare API surfaces
+      shell: bash
+      env:
+        SEMVER_GUARD_FROM: ${{ inputs.from }}
+        SEMVER_GUARD_TO: ${{ inputs.to }}
+        SEMVER_GUARD_FROM_REF: ${{ inputs.from-ref }}
+        SEMVER_GUARD_TO_REF: ${{ inputs.to-ref }}
+        SEMVER_GUARD_BASELINE: ${{ inputs.baseline }}
+        SEMVER_GUARD_FORMAT: ${{ inputs.format }}
+        SEMVER_GUARD_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      run: node "$GITHUB_ACTION_PATH/dist/action-cli.js"

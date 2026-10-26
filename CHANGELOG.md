@@ -4,6 +4,22 @@ All notable changes to semver-guard are listed here. The project follows [Semant
 
 Versions 1 and 2 were both published under the package version `0.1.0`. Version 3 is the first release under `0.2.0`.
 
+## v6 (0.5.0): GitHub Action
+
+### Added
+
+- `action.yml`: a composite GitHub Action, so a workflow can run semver-guard in one step. Inputs: `from`, `to`, `from-ref`, `to-ref`, `baseline`, `format` (default `table`) and `working-directory` (default `.`, for a package in a monorepo). The step fails when breaking changes are found (exit code `1`) or on errors (exit code `2`), and passes otherwise.
+- The action installs its dependencies and builds the CLI from source in its own checkout (`$GITHUB_ACTION_PATH`) on every run; no built `dist/` is committed.
+- The step log shows the exact command that ran (`$ semver-guard compare --from-ref=... --to-ref=... --format=table`) followed by the report. A failure adds an error annotation (`6 breaking changes found. ...`, or the first line of the error), and the report is added to the job summary.
+- Inputs are mapped to CLI arguments by `src/action.ts` (entry point `dist/action-cli.js`): values are trimmed, empty inputs are left out, each option is passed as `--name=value`, and a side with both or neither of its directory and ref inputs is rejected with the input names before the CLI runs. Inputs reach the step only through environment variables, never through `${{ inputs.* }}` inside a shell script.
+- `examples/release-gate.yml`: a pull request workflow that compares the base branch with the head commit.
+
+### Project
+
+- `test/action.test.ts`: the input mapping, `runAction` against the fixtures and a temporary git repository, the built entry point, and checks that `action.yml` and the example parse and agree with the mapping module (207 tests).
+- A CI job runs the action from the repository (`uses: ./`) and checks that it passes, fails on breaking changes, and fails on invalid inputs.
+- `yaml` is a new dev dependency, used only by the tests.
+
 ## v5 (0.4.0): wildcard baselines and wrapped components
 
 ### Added

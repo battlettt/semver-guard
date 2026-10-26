@@ -66,3 +66,47 @@ jobs:
             const ok = r.summary.breaking === 1 && r.changes[0].code === 'export-removed' && r.changes[0].export === 'parse';
             if (!ok) { console.error(JSON.stringify(r, null, 2)); process.exit(1); }
           "
+
+  action:
+    name: GitHub Action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Action passes without breaking changes
+        uses: ./
+        with:
+          from: fixtures/after
+          to: fixtures/after
+      - name: Action fails on breaking changes
+        id: breaking
+        continue-on-error: true
+        uses: ./
+        with:
+          from: fixtures/before
+          to: fixtures/after
+          format: json
+      - name: Action fails on invalid inputs
+        id: invalid
+        continue-on-error: true
+        uses: ./
+        with:
+          from: fixtures/before
+          from-ref: HEAD
+          to: fixtures/after
+      - name: Check the outcomes
+        env:
+          BREAKING: ${{ steps.breaking.outcome }}
+          INVALID: ${{ steps.invalid.outcome }}
+        run: |
+          test "$BREAKING" = failure || { echo "expected the breaking step to fail, got $BREAKING"; exit 1; }
+          test "$INVALID" = failure || { echo "expected the invalid-inputs step to fail, got $INVALID"; exit 1; }
+      - name: Action compares git refs
+        uses: ./
+        with:
+          from-ref: HEAD
+          to-ref: HEAD

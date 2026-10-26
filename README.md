@@ -297,6 +297,8 @@ Because a breaking change exits with code 1, the command can gate a release job 
 - run: npx semver-guard compare --from-ref "$(git describe --tags --abbrev=0)" --to-ref HEAD
 ```
 
+On GitHub Actions you can also use the [GitHub Action](#github-action) instead of `npx`.
+
 ### As a library
 
 ```ts
@@ -308,6 +310,67 @@ if (filtered.changes.length > 0) console.log(formatTable(filtered));
 ```
 
 `extractApi(dir, { entryPoints: false })` ignores `package.json` and treats every module as public. Unlike the CLI, `extractApi` decides about entry points per snapshot; use `findEntryPoints(dir)` on both sides if you want the CLI's both-or-neither rule.
+
+## GitHub Action
+
+The repository is also a GitHub Action, so a workflow can gate pull requests or releases in one step. This release gate compares the pull request's base branch with its head commit and fails the job if the head breaks the API ([`examples/release-gate.yml`](examples/release-gate.yml) is the complete workflow):
+
+```yaml
+name: Release gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  api-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # both refs must be in the clone
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci        # so imported dependency types resolve at both refs
+      - uses: <owner>/semver-guard@v6
+        with:
+          from-ref: origin/${{ github.base_ref }}
+          to-ref: ${{ github.event.pull_request.head.sha }}
+```
+
+Replace `<owner>` with the account that publishes the action, and pin a tag or a full commit SHA. To try the action from a checkout of this repository (as the example and this project's CI do), use `uses: ./` instead.
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `from` | | Directory snapshot of the previous version, relative to `working-directory`. Set this or `from-ref`. |
+| `to` | | Directory snapshot of the new version, relative to `working-directory`. Set this or `to-ref`. |
+| `from-ref` | | Git tag, branch or commit of the previous version. Set this or `from`. |
+| `to-ref` | | Git tag, branch or commit of the new version. Set this or `to`. |
+| `baseline` | | JSON file of accepted breaking changes, relative to `working-directory` (see [Accepting changes with a baseline](#accepting-changes-with-a-baseline)). |
+| `format` | `table` | `table` or `json`. |
+| `working-directory` | `.` | Directory to run in, relative to the workspace. With refs, this directory is compared at each ref, so set it to the package directory in a monorepo. |
+
+Behaviour:
+
+- **Pass/fail.** The step passes when there are no breaking changes (or all are accepted by the baseline), and fails when there are breaking changes (exit code `1`) or on an error (exit code `2`: bad inputs, a missing directory or ref, a malformed baseline). Use `continue-on-error: true` on the step to report without blocking.
+- **Output.** The step log shows the command that ran, for example `$ semver-guard compare --from-ref=origin/main --to-ref=4b1e... --format=table`, followed by the report. A failure also adds an error annotation to the run (`6 breaking changes found. ...`), and the report is added to the job summary.
+- **Inputs.** Each side needs exactly one of its directory and ref inputs; setting both, or neither, fails the step with a message naming the inputs. Empty inputs count as not set and values are trimmed. Each input is passed to the CLI as `--name=value` (`src/action.ts` does the mapping and is unit-tested).
+- **Refs need history.** `actions/checkout` makes a shallow clone of a single commit by default, so set `fetch-depth: 0` (or fetch the refs you compare). On `pull_request`, the base branch is available as `origin/<base>` and the head commit as `github.event.pull_request.head.sha`; `HEAD` is GitHub's merge commit of the two.
+- **Node.js.** The action runs on the job's `node`, which must be version 20 or newer (GitHub-hosted runners have it; on other runners, add `actions/setup-node`). It runs `bash` steps, which GitHub-hosted Linux, macOS and Windows runners all provide.
+
+### The action builds from source
+
+No built `dist/` is committed. On every run, the action installs its own dependencies with `npm ci` and builds the CLI with `npm run build` in its own checkout, then runs `node dist/action-cli.js` there with the workspace (or `working-directory`) as the current directory. This adds the install and compile time (usually well under a minute) to each run and needs access to the npm registry.
+
+The action finds its own checkout through `$GITHUB_ACTION_PATH`, which the runner sets for composite actions to the directory containing `action.yml` (the same value as `${{ github.action_path }}`):
+
+- with `uses: <owner>/semver-guard@v6`, the copy of the repository the runner downloaded at that tag, under the runner's `_actions` directory;
+- with `uses: ./` (or `./path/to/semver-guard`), that directory of the workspace, so `node_modules` and `dist` are created there.
+
+Your own package is never built or installed by the action; it is only read (from the directory inputs, or with `git archive` from the refs).
 
 ## Breaking-change rules
 
@@ -589,6 +652,7 @@ Targets that cannot be mapped are skipped as long as at least one target resolve
 - **Compatibility is checked per position.** Each changed parameter or return type is checked on its own, within the overload it belongs to. Type parameter constraints and defaults are still compared by text, so widening a constraint (`T extends string` → `T extends string | number`) is reported.
 - **Parameter matching is positional.** Inserting an optional parameter in the middle is reported as changes to the parameters that follow it.
 - **Not inspected yet:** `this` parameters, `implements` clauses, `declare module 'x'` / `declare global` augmentations, `export =` objects beyond their overall type, and JavaScript (`.js`/`.jsx`) files with JSDoc types.
+- **GitHub Action.** The action builds from source on every run and does not cache its dependencies or build. It has no outputs (such as the number of breaking changes); read the report from the log or the job summary, or run the CLI directly with `--format json`. It does not comment on pull requests.
 - **Baseline matching.** Entries match on `code`, `export`, `member` and optionally `file`. Only `export` and `member` accept `*` wildcards; `file` and `code` are exact, and there are no character classes, alternatives or negations. An accepted change stays accepted even if it changes again in a different way under the same code (for example, a second, different signature change to an accepted function), and a wildcard entry also accepts future changes that happen to match it.
 
 ## Development
@@ -612,11 +676,13 @@ Project layout:
 | `src/format.ts` | Table and JSON output. |
 | `src/run.ts` / `src/cli.ts` | Argument parsing, exit codes, and the executable entry point. |
 | `src/model.ts` | Types shared by the modules above. |
+| `action.yml`, `src/action.ts` / `src/action-cli.ts` | The GitHub Action: the composite action definition, the mapping from action inputs to CLI arguments, and its entry point. |
+| `examples/release-gate.yml` | Example pull request workflow that uses the action. |
 | `fixtures/before`, `fixtures/after` | Two versions of a small package used by the tests and the examples above. |
 | `fixtures/components-before`, `fixtures/components-after` | Two versions of a small `.tsx` component package (widened props, narrowed props, a removed component, internal changes). |
-| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`, including wildcard entries), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback), `tsx.test.ts` (`.tsx` files, component props and the component fixtures), `components.test.ts` (`React.FC`-typed, `memo` and `forwardRef` components), `alias.test.ts` (type alias identity and its fallback). |
+| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`, including wildcard entries), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback), `tsx.test.ts` (`.tsx` files, component props and the component fixtures), `components.test.ts` (`React.FC`-typed, `memo` and `forwardRef` components), `alias.test.ts` (type alias identity and its fallback), `action.test.ts` (action input mapping, the action against the fixtures and a git repository, and checks of `action.yml` and the example workflow). |
 
-The tests in `cli.test.ts` that run `dist/cli.js` as a separate process are skipped until `npm run build` has been run. CI always builds first.
+The tests in `cli.test.ts` and `action.test.ts` that run `dist/cli.js` or `dist/action-cli.js` as a separate process are skipped until `npm run build` has been run. CI always builds first.
 
 ## License
 

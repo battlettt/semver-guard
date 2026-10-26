@@ -1,0 +1,52 @@
+# Release gate: fail a pull request that breaks the package's public API.
+#
+# Copy this file to .github/workflows/release-gate.yml. It compares the API at
+# the pull request's base branch with the API at the pull request's head
+# commit, and the job fails when semver-guard reports a breaking change.
+name: Release gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  api-compatibility:
+    name: No breaking API changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, so both the base branch and the head commit can be
+          # read as git refs (a shallow clone has neither).
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Install the package's own dependencies so that imported types (React,
+      # Node.js, ...) resolve the same way at both refs. semver-guard links
+      # this node_modules into each extracted ref.
+      - run: npm ci
+
+      # `uses: ./` runs the action from this repository's checkout, which is
+      # how semver-guard tests the action on itself. Once the action is
+      # published, other repositories reference it by owner/name and tag
+      # instead, for example:
+      #
+      #   - uses: <owner>/semver-guard@v6
+      #
+      # (replace <owner> with the account that publishes semver-guard, and pin
+      # a tag or a full commit SHA). The inputs stay the same.
+      - name: Check for breaking changes
+        uses: ./
+        with:
+          from-ref: origin/${{ github.base_ref }}
+          to-ref: ${{ github.event.pull_request.head.sha }}
+          # Optional: accepted breaking changes, see "Accepting changes with a
+          # baseline" in the README.
+          # baseline: semver-baseline.json
+          # Optional: for a package in a subdirectory of a monorepo.
+          # working-directory: packages/my-lib
