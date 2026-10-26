@@ -11,8 +11,12 @@ import type { DeclarationRef } from './model.js';
  * - `covariant` (return types, read-only properties): the new type must be
  *   assignable to the old one,
  * - `invariant` (types that consumers both read and supply): both.
+ * - `identical` (type alias targets): both, and the checker must also consider
+ *   the two types identical. `string` and `string & {}` are assignable to
+ *   each other but are not identical (they reduce differently in unions and
+ *   conditional types); `Array<string>` and `string[]` are identical.
  */
-export type Variance = 'contravariant' | 'covariant' | 'invariant';
+export type Variance = 'contravariant' | 'covariant' | 'invariant' | 'identical';
 
 /** A type whose text changed between versions, and where the new one is declared. */
 export interface TypeQuery {
@@ -35,6 +39,8 @@ export function typeQueryKey(query: TypeQuery): string {
 /** Name of the probe declarations inserted into the new version. */
 const PROBE = '__semverGuardOld';
 const PROBE_NAME = new RegExp(`^${PROBE}(\\d+)$`);
+/** Name of the identity test inserted next to a type alias probe. */
+const IDENTITY_PROBE = '__semverGuardSame';
 
 interface Probe {
   id: number;
@@ -154,6 +160,12 @@ export function checkTypeQueries(root: string, queries: TypeQuery[]): Map<string
       const widens = () => checker.isTypeAssignableTo(oldType, newType);
       const narrows = () => checker.isTypeAssignableTo(newType, oldType);
       const variance = probe.query.variance;
+      if (variance === 'identical') {
+        const same = identityProbe(node, probe.id);
+        if (!same) continue;
+        answers.set(probe.key, widens() && narrows() && checker.getTypeFromTypeNode(same.type) === checker.getTrueType());
+        continue;
+      }
       answers.set(
         probe.key,
         variance === 'contravariant' ? widens() : variance === 'covariant' ? narrows() : widens() && narrows(),
@@ -178,6 +190,7 @@ function planInsertion(sourceFile: ts.SourceFile, probe: Probe): Insertion | und
   });
 
   if (query.position === 'type') {
+    if (ts.isTypeAliasDeclaration(decl)) return aliasInsertion(sourceFile, decl, probe);
     if (ts.isParameter(decl)) return param(decl.getStart(sourceFile), '', ', ');
     if (
       ts.isPropertyDeclaration(decl) ||
@@ -206,10 +219,56 @@ function planInsertion(sourceFile: ts.SourceFile, probe: Probe): Insertion | und
   return target ? param(target.getStart(sourceFile), '', ', ') : undefined;
 }
 
+/**
+ * Inserts, in front of a type alias, the old target as another alias, and an
+ * alias that is `true` only if the checker considers the old and new targets
+ * identical. The identity test compares two generic functions that differ
+ * only in their conditional types, which the checker relates by type identity:
+ *
+ * ```ts
+ * type __semverGuardOld0 = string;
+ * type __semverGuardSame0 = (<T>() => T extends __semverGuardOld0 ? 1 : 2) extends (<T>() => T extends ID ? 1 : 2) ? true : false;
+ * export type ID = string | number;
+ * ```
+ *
+ * Generic aliases are not supported: their targets mention type parameters
+ * that only exist inside each declaration.
+ */
+function aliasInsertion(sourceFile: ts.SourceFile, decl: ts.TypeAliasDeclaration, probe: Probe): Insertion | undefined {
+  if (decl.typeParameters?.length || !(ts.isSourceFile(decl.parent) || ts.isModuleBlock(decl.parent))) return undefined;
+  const name = `${PROBE}${probe.id}`;
+  const prefix = `type ${name} = `;
+  const test = (target: string) => `(<__semverGuardT>() => __semverGuardT extends ${target} ? 1 : 2)`;
+  return {
+    at: decl.getStart(sourceFile),
+    text:
+      `${prefix}${probe.query.before};\n` +
+      `type ${IDENTITY_PROBE}${probe.id} = ${test(name)} extends ${test(decl.name.text)} ? true : false;\n`,
+    typeOffset: prefix.length,
+    probe,
+  };
+}
+
+/** The identity test inserted after a type alias probe. */
+function identityProbe(probe: ProbeNode, id: number): ts.TypeAliasDeclaration | undefined {
+  if (!ts.isTypeAliasDeclaration(probe)) return undefined;
+  const statements = (probe.parent as ts.SourceFile | ts.ModuleBlock).statements;
+  const next = statements[statements.indexOf(probe) + 1];
+  return next && ts.isTypeAliasDeclaration(next) && next.name.text === `${IDENTITY_PROBE}${id}` ? next : undefined;
+}
+
 /** The type of the new declaration that a probe was inserted in front of. */
 function targetType(checker: ts.TypeChecker, probe: ProbeNode, query: TypeQuery): ts.Type | undefined {
   const fromAnnotation = (node: ts.TypeNode | undefined, decl: ts.Declaration) =>
     node ? checker.getTypeFromTypeNode(node) : declarationType(checker, decl);
+
+  if (ts.isTypeAliasDeclaration(probe)) {
+    // The old target alias, the identity test, then the new alias.
+    const statements = (probe.parent as ts.SourceFile | ts.ModuleBlock).statements;
+    const target = statements[statements.indexOf(probe) + 2];
+    if (!target || !ts.isTypeAliasDeclaration(target) || isProbe(target)) return undefined;
+    return checker.getTypeFromTypeNode(target.type);
+  }
 
   if (query.position === 'return') {
     const decl = probe.parent;
@@ -287,7 +346,7 @@ function containsAny(
   return visit(type, 0);
 }
 
-type ProbeNode = (ts.ParameterDeclaration | ts.PropertyDeclaration | ts.PropertySignature) & {
+type ProbeNode = (ts.ParameterDeclaration | ts.PropertyDeclaration | ts.PropertySignature | ts.TypeAliasDeclaration) & {
   type?: ts.TypeNode;
 };
 
@@ -301,7 +360,10 @@ function probeNodes(sourceFile: ts.SourceFile): Map<number, ProbeNode> {
   const nodes = new Map<number, ProbeNode>();
   const visit = (node: ts.Node): void => {
     if (
-      (ts.isParameter(node) || ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) &&
+      (ts.isParameter(node) ||
+        ts.isPropertyDeclaration(node) ||
+        ts.isPropertySignature(node) ||
+        ts.isTypeAliasDeclaration(node)) &&
       ts.isIdentifier(node.name)
     ) {
       const match = PROBE_NAME.exec(node.name.text);

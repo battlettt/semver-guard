@@ -124,7 +124,7 @@ describe('usage and I/O errors exit 2', () => {
     const empty = makeSnapshot({ 'README.md': '# nothing here' });
     const { code, stderr } = cli('compare', '--from', empty, '--to', AFTER);
     expect(code).toBe(2);
-    expect(stderr).toContain('no TypeScript (.ts) files found');
+    expect(stderr).toContain('no TypeScript (.ts or .tsx) files found');
   });
 });
 

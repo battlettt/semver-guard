@@ -4,6 +4,24 @@ All notable changes to semver-guard are listed here. The project follows [Semant
 
 Versions 1 and 2 were both published under the package version `0.1.0`. Version 3 is the first release under `0.2.0`.
 
+## v4 (0.3.0): .tsx support and type alias identity
+
+### Added
+
+- `.tsx` files are scanned alongside `.ts`, `.mts` and `.cts`. Their exports count toward the public surface under the same rules, and `package.json` targets map to `.tsx` sources (`./dist/index.js` -> `src/index.tsx`, `./button.jsx` -> `button.tsx`, extensionless and directory targets try `.tsx` and `index.tsx`). JSX is type-checked with `jsx: react-jsx`.
+- Function components need no special casing: props are the first parameter and follow the parameter rule (widening is allowed, narrowing is reported).
+- A parameter annotated with a non-exported interface or object type alias of the same module (the usual `type Props = {...}`) is now compared by its members when its name is unchanged. Before, only the name was compared, so changes to such a type were never reported.
+
+### Changed
+
+- Changed type alias targets are compared with the type checker. A change is only allowed when the old and new targets are mutually assignable **and** identical to the checker: `Array<string>` -> `string[]` is no longer reported, while `string` -> `string | number` and `string` -> `string & {}` still are. Generic aliases, targets involving `any`, and old targets that no longer resolve fall back to the text comparison.
+- The "no TypeScript files" error now reads `no TypeScript (.ts or .tsx) files found`.
+
+### Project
+
+- `fixtures/components-before` and `fixtures/components-after`: a small `.tsx` component package. CI runs the built CLI against it.
+- `test/tsx.test.ts` and `test/alias.test.ts`.
+
 ## v3 (0.2.0): compatibility-aware comparison
 
 ### Changed

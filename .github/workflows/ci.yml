@@ -33,6 +33,9 @@ jobs:
           node dist/cli.js compare --from fixtures/before --to fixtures/after --format json > report.json
           test $? -eq 1 || exit 1
           node -e "const r = require('./report.json'); if (r.summary.breaking !== 6) process.exit(1)"
+          node dist/cli.js compare --from fixtures/components-before --to fixtures/components-after --format json > components.json
+          test $? -eq 1 || exit 1
+          node -e "const r = require('./components.json'); if (r.summary.breaking !== 2) process.exit(1)"
       - name: Smoke-test the CLI in git ref mode
         run: |
           set +e

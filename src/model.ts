@@ -14,6 +14,14 @@ export interface Param {
   type: string;
   optional: boolean;
   rest: boolean;
+  /**
+   * Members of the parameter's type, e.g. `{ label: string; size?: number }`,
+   * when it is annotated with a reference to an object type that is declared
+   * in the snapshot but not exported from its module (such as the `Props` of
+   * a component). Such a type is compared nowhere else, so its name alone
+   * would hide changes to it.
+   */
+  structure?: string;
 }
 
 /**
@@ -83,6 +91,8 @@ export interface TypeAliasShape {
   kind: 'type';
   typeParams: TypeParam[];
   type: string;
+  /** The alias declaration, used to compare a changed target with the type checker. */
+  declaration?: DeclarationRef;
 }
 
 export interface EnumMember {

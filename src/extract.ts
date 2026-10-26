@@ -17,8 +17,8 @@ import type {
   TypeParam,
 } from './model.js';
 
-/** Matches .ts, .mts and .cts files, including their .d.ts variants. */
-const SOURCE_FILE = /\.[mc]?ts$/;
+/** Matches .ts, .mts, .cts and .tsx files, including the .d.ts variants. */
+const SOURCE_FILE = /\.(?:[mc]?ts|tsx)$/;
 const IGNORED_DIRS = new Set(['node_modules']);
 
 /**
@@ -33,6 +33,9 @@ export const COMPILER_OPTIONS: ts.CompilerOptions = {
   noEmit: true,
   skipLibCheck: true,
   allowImportingTsExtensions: true,
+  // .tsx files use the automatic runtime (`react/jsx-runtime`). Without React
+  // types installed, JSX expressions are typed as `any` on both sides.
+  jsx: ts.JsxEmit.ReactJSX,
   types: [],
 };
 
@@ -128,7 +131,7 @@ export function extractApi(rootDir: string, options: ExtractOptions = {}): ApiSu
   const root = snapshotRoot(rootDir, options.label);
   const files = findSourceFiles(root);
   if (files.length === 0) {
-    throw new SnapshotError(`no TypeScript (.ts) files found under ${options.label ?? rootDir}`);
+    throw new SnapshotError(`no TypeScript (.ts or .tsx) files found under ${options.label ?? rootDir}`);
   }
   const relOf = (file: string) => toPosix(path.relative(root, file));
   const sources = new Set(files.map(relOf));
@@ -303,6 +306,7 @@ class Extractor {
         kind: 'type',
         typeParams: this.typeParams(alias.typeParameters),
         type: this.nodeText(alias.type),
+        declaration: declarationRef(alias),
       });
     }
     if (enums.length > 0) shapes.push(this.enumShape(enums));
@@ -635,7 +639,7 @@ class Extractor {
           rest: false,
         };
       }
-      return {
+      const param: Param = {
         name: this.nodeText(paramDecl.name),
         type: paramDecl.type
           ? this.nodeText(paramDecl.type)
@@ -646,6 +650,9 @@ class Extractor {
           this.checker.isOptionalParameter(paramDecl),
         rest: paramDecl.dotDotDotToken !== undefined,
       };
+      const structure = paramDecl.type && this.localStructure(paramDecl.type);
+      if (structure !== undefined) param.structure = structure;
+      return param;
     });
     const returnType =
       decl?.type !== undefined
@@ -654,6 +661,53 @@ class Extractor {
     const result: Signature = { typeParams, params, returnType };
     if (decl) result.declaration = declarationRef(decl);
     return result;
+  }
+
+  /**
+   * The members of a type reference that names an interface or object type
+   * alias declared at the top level of a snapshot module without being
+   * exported from it, printed as an object type literal. Undefined for every
+   * other type, including types with call or construct signatures.
+   */
+  private localStructure(node: ts.TypeNode): string | undefined {
+    if (!ts.isTypeReferenceNode(node)) return undefined;
+    const symbol = this.checker.getSymbolAtLocation(node.typeName);
+    // Imported names are exported from the module that declares them.
+    if (!symbol || symbol.flags & ts.SymbolFlags.Alias) return undefined;
+    const decls = symbol.declarations ?? [];
+    const local = (d: ts.Declaration) =>
+      (ts.isInterfaceDeclaration(d) || ts.isTypeAliasDeclaration(d)) &&
+      ts.isSourceFile(d.parent) &&
+      d.getSourceFile().fileName.startsWith(this.rootPrefix);
+    if (decls.length === 0 || !decls.every(local)) return undefined;
+    const moduleSymbol = this.checker.getSymbolAtLocation(decls[0].getSourceFile());
+    if (!moduleSymbol) return undefined;
+    const exported = this.checker
+      .getExportsOfModule(moduleSymbol)
+      .some((e) => (e.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(e) : e) === symbol);
+    if (exported) return undefined;
+
+    const type = this.checker.getTypeFromTypeNode(node);
+    const parts = type.isIntersection() ? type.types : [type];
+    if (!parts.every((t) => t.flags & ts.TypeFlags.Object)) return undefined;
+    if (type.getCallSignatures().length > 0 || type.getConstructSignatures().length > 0) return undefined;
+    const members: string[] = [];
+    for (const property of this.checker.getPropertiesOfType(type)) {
+      const decl = property.valueDeclaration;
+      const readonly = decl !== undefined && hasModifier(decl, ts.SyntaxKind.ReadonlyKeyword);
+      const name = property.getName();
+      const key = /^[A-Za-z_$][\w$]*$/.test(name) ? name : JSON.stringify(name);
+      const optional = property.flags & ts.SymbolFlags.Optional ? '?' : '';
+      const propertyType = this.typeString(this.checker.getTypeOfSymbolAtLocation(property, node), node);
+      members.push(`${readonly ? 'readonly ' : ''}${key}${optional}: ${propertyType}`);
+    }
+    for (const info of this.checker.getIndexInfosOfType(type)) {
+      const keyType = this.typeString(info.keyType, node);
+      members.push(
+        `${info.isReadonly ? 'readonly ' : ''}[key: ${keyType}]: ${this.typeString(info.type, node)}`,
+      );
+    }
+    return members.length === 0 ? '{}' : `{ ${members.join('; ')} }`;
   }
 
   private typeParams(decls: ts.NodeArray<ts.TypeParameterDeclaration> | undefined): TypeParam[] {

@@ -68,7 +68,7 @@ Each side needs exactly one of a directory or a ref: `--from` with `--from-ref` 
 | --- | --- |
 | `0` | No breaking changes. |
 | `1` | At least one breaking change was found. |
-| `2` | Usage error (bad or missing arguments, a directory and a ref given for the same side, or refs given outside a git repository), I/O error (directory missing, not a directory, or no `.ts` files in it), git error (unknown ref, or the current directory does not exist at that ref), or a missing or malformed baseline file. |
+| `2` | Usage error (bad or missing arguments, a directory and a ref given for the same side, or refs given outside a git repository), I/O error (directory missing, not a directory, or no `.ts`/`.tsx` files in it), git error (unknown ref, or the current directory does not exist at that ref), or a missing or malformed baseline file. |
 
 Changes suppressed by a baseline do not count: if every reported change is accepted, the exit code is `0`.
 
@@ -285,7 +285,7 @@ if (filtered.changes.length > 0) console.log(formatTable(filtered));
 
 ## Breaking-change rules
 
-semver-guard compares **declarations as written**. Types whose printed text is equal (after removing comments and collapsing whitespace) are always equal. When the type of a parameter, a return type, or the type of a class or interface property changes, the TypeScript type checker decides whether the change can break consumers, using the [compatibility rules](#type-compatibility-rules) below. Everything else (type aliases, exported variables, type parameter constraints and defaults, `extends` clauses) is compared by text. These rules err on the side of reporting a change.
+semver-guard compares **declarations as written**. Types whose printed text is equal (after removing comments and collapsing whitespace) are always equal. When the type of a parameter, a return type, or the type of a class or interface property changes, the TypeScript type checker decides whether the change can break consumers, using the [compatibility rules](#type-compatibility-rules) below. When the target of a type alias changes, the checker decides whether the old and new targets are the same type (see [Type aliases](#type-aliases)). Everything else (exported variables, type parameter constraints and defaults, `extends` clauses) is compared by text. These rules err on the side of reporting a change.
 
 ### Type compatibility rules
 
@@ -296,6 +296,7 @@ A changed type is only reported if some consumer code that compiled against the 
 | Parameter of a function, class method or constructor, or of an interface method | Widening | The old type must be assignable to the new type, so every argument callers pass today is still accepted. | `f(a: string)` → `f(a: string \| number)`<br>`f(mode: 'light' \| 'dark')` → `f(mode: 'light' \| 'dark' \| 'system')` | `f(a: string \| number)` → `f(a: string)` |
 | Return type of a function or class method, or the type of a `readonly` class property (including a getter without a setter) | Narrowing | The new type must be assignable to the old type, so every value callers receive is still something they handle. | `f(): string \| number` → `f(): string` | `f(): string` → `f(): string \| undefined` |
 | Interface method return type; parameters and return type of interface call and construct signatures; writable class properties; interface properties | None | Assignable in both directions (equivalent types), because consumers both read these and supply them (object literals, `implements`, assignments). | `p: string[]` → `p: Array<string>` | `p: string` → `p: string \| number` |
+| Target of an exported type alias | None | Assignable in both directions **and** identical to the checker. See [Type aliases](#type-aliases). | `type Names = Array<string>` → `type Names = string[]` | `type ID = string` → `type ID = string \| number`<br>`type ID = string` → `type ID = string & {}` |
 
 Some changes that the text comparison of earlier versions reported are no longer reported, because the types are the same or compatible:
 
@@ -312,17 +313,25 @@ export declare function run(files: string[] | ReadonlySet<string>, options: Sett
 
 Interface method return types stay strict because a narrower return type breaks existing implementations that return the old, wider type. Interface method parameters may widen because TypeScript checks method parameters bivariantly, so existing implementations still compile.
 
+**Non-exported parameter types.** A parameter annotated with the name of an interface or object type alias that is declared in the snapshot but **not exported** from its module (the usual `type Props = {...}` next to a component) is compared by its members, because the type is not compared anywhere else and its name alone would hide every change to it. The members are printed as an object type (`{ label: string; size?: number | undefined }`) and compared like any other parameter type, so adding an optional member or a union member is allowed, and adding a required member or removing a union member is reported:
+
+```
+signature-changed  Card  src/index.tsx  type of parameter { title, theme } (CardProps) changed from { title: string; theme?: Theme | undefined } to { title: string; theme: Theme }
+```
+
+This applies when the name is the same in both versions and refers to a top-level `interface` or `type` of the same module. Types that are exported are compared by their own rules where they are exported, and the signatures that mention them are only compared by name.
+
 Each old overload only needs one compatible new signature, so merging `f(a: string)` and `f(a: number)` into a single `f(a: string | number)` is not reported.
 
 The rules for the number of parameters do not change: an added optional, defaulted or rest parameter is allowed, an added required parameter and a removed parameter are reported.
 
-**How it works.** For each changed type, semver-guard inserts the old type text next to the matching declaration in a copy of the new version (as an extra parameter or property) and asks the type checker whether it is assignable to the new type. Names in the old type are therefore resolved in the new version's scope, including imports and type parameters. The snapshots on disk are not modified.
+**How it works.** For each changed type, semver-guard inserts the old type text next to the matching declaration in a copy of the new version (as an extra parameter, property, or, for a type alias, another type alias) and asks the type checker whether it is assignable to the new type. Names in the old type are therefore resolved in the new version's scope, including imports and type parameters. The snapshots on disk are not modified.
 
 **Text fallback.** When the checker types are unavailable for a pair of types, semver-guard falls back to the text comparison for that pair and reports the change if the texts differ. This happens when:
 
 - the old type refers to a name that no longer exists in the new version (for example, a type that was renamed or deleted), or has any other type error in the new version's scope,
 - either type is or contains `any` (`any` is assignable in both directions, which would hide real changes),
-- the declaration cannot hold the inserted old type: an arrow function written without parentheses (`x => x`), a type predicate return type (`x is string`), or a signature that the checker synthesized without a declaration of its own,
+- the declaration cannot hold the inserted old type: an arrow function written without parentheses (`x => x`), a type predicate return type (`x is string`), a signature that the checker synthesized without a declaration of its own, or a generic type alias (`type Box<T> = ...`, whose target mentions type parameters that only exist inside each version's declaration),
 - the source file of the new declaration cannot be read.
 
 The fallback is silent, like the entry-point fallback: the reported change looks the same as any other. Library users can turn off the checker entirely with `compareSurfaces(before, after, labels, { typeComparison: 'text' })`, which restores the text comparison of earlier versions.
@@ -362,6 +371,49 @@ Every signature (overload) of the old version must still exist in the new versio
 | New type parameter **with** a default | no |
 | New overload added | no |
 | Overload removed | **yes** |
+
+### React components (`.tsx`)
+
+`.tsx` files are scanned like `.ts` files: their exported functions, classes, interfaces, type aliases, enums and variables are part of the public surface, under the same rules. A function component is an exported function (or `const` arrow function) like any other, and its props are its first parameter, so props follow the parameter rule: they may **widen** and may not **narrow**.
+
+```tsx
+// 2.3.0
+type ButtonProps = { label: string; variant: 'primary' | 'secondary' };
+export function Button(props: ButtonProps) { /* ... */ }
+interface CardProps { title: string; theme?: Theme }
+export const Card = ({ title, theme }: CardProps) => /* ... */;
+export function Tooltip({ text }: { text: string }) { /* ... */ }
+
+// 2.4.0
+type ButtonProps = { label: string; variant: 'primary' | 'secondary' | 'ghost'; icon?: string }; // widened: not reported
+export function Button(props: ButtonProps) { /* ... */ }
+interface CardProps { title: string; theme: Theme }                                            // narrowed: reported
+export const Card = ({ title, theme }: CardProps) => /* ... */;
+// Tooltip deleted                                                                              // removed: reported
+```
+
+```
+$ semver-guard compare --from fixtures/components-before --to fixtures/components-after
+semver-guard: fixtures/components-before -> fixtures/components-after (4 exports in 5 files checked)
+
+CHANGE             EXPORT   FILE           DETAILS
+signature-changed  Card     src/index.tsx  type of parameter { title, theme } (CardProps) changed from { title: string; theme?: Theme | undefined } to { title: string; theme: Theme }
+                                           before: ({ title, theme }: CardProps): any
+                                           after:  ({ title, theme }: CardProps): any
+export-removed     Tooltip  src/index.tsx  function Tooltip was removed
+
+2 breaking changes found. Releasing this as a minor or patch version would break consumers; bump the major version.
+```
+
+The same package also rewrites the non-exported `className` helper in `Button.tsx` and changes the signature of `iconFor` in `icons.tsx`, a module that `Button.tsx` imports but the entry point does not export. Neither is reported.
+
+Props types are compared where they are written:
+
+- **Inline** (`props: { label: string }`): compared as the parameter type.
+- **Not exported** (`type Props = ...` or `interface Props` in the same module): compared by members, see [Non-exported parameter types](#type-compatibility-rules).
+- **Exported** (`export interface ButtonProps`): reported on the props type itself, by the [interface](#interfaces) or [type alias](#type-aliases) rules, which are stricter than the parameter rule because consumers also read and implement exported types. For example, a new optional prop is fine, but widening a union-typed prop of an exported interface is reported.
+
+JSX is type-checked with the automatic runtime (`jsx: react-jsx`, importing `react/jsx-runtime`). If the snapshot has React's types in `node_modules`, component return types are `JSX.Element` (or whatever the runtime declares); without them, JSX expressions are typed as `any` and return types print as `any` on both sides, which does not affect the props comparison.
 
 ### Classes
 
@@ -404,11 +456,36 @@ Declaration-merged interfaces are compared as one interface.
 
 ### Type aliases
 
+When the target of an exported type alias changes, the change is only allowed if the old and new targets are **the same type**: assignable to each other in both directions, *and* identical to the type checker.
+
 | Change | Breaking? | Code |
 | --- | --- | --- |
-| Any change to the aliased type text | **yes** | `type-changed` |
+| Target widened (`type ID = string` → `string \| number`, a member added to a union) | **yes** | `type-changed` |
+| Target narrowed or changed to an unrelated type | **yes** | `type-changed` |
+| Target changed to a mutually assignable but not identical type (`string` → `string & {}`, `{ a: A } & { b: B }` → `{ a: A; b: B }`) | **yes** | `type-changed` |
+| Target respelled as an identical type (`Array<string>` → `string[]`, `'a' \| 'b'` → `'b' \| 'a'`, reordered object members, `Record<string, number>` → `{ [key: string]: number }`, an interface → an object type with the same members) | no | |
 | Type parameters changed (rules above) | **yes** | `type-parameters-changed` |
 | Formatting or comment changes only | no | |
+
+```ts
+// before                         // after                                 reported?
+export type ID = string;          export type ID = string | number;        // yes
+export type Names = Array<string>; export type Names = string[];           // no
+export type Tag = string;         export type Tag = string & {};           // yes
+```
+
+**Why widening is reported.** A wider parameter type is safe because callers only *supply* values. An alias is different: it is used in every position at once. Widening `ID` widens every signature and property that mentions it, so any function that returns an `ID`, or object that exposes one, can now hand callers a value they did not expect (a `number` where they call `id.toUpperCase()`), and consumers who use `ID` in their own declarations and type-level code see it change meaning. The signatures that mention the alias are not reported again; the change is reported once, on the alias.
+
+**Why identity, not just mutual assignability.** `string` and `string & {}` accept exactly the same values, but they are different types: `'a' | string` reduces to `string`, while `'a' | (string & {})` keeps `'a'` (this is why the second form is used to keep editor suggestions), so conditional types, mapped types and unions over the alias can produce different results. semver-guard therefore requires the checker's own identity relation, the one TypeScript uses for `T extends X ? ...` comparisons. It is tested with a generic-function comparison inserted next to the alias:
+
+```ts
+type __semverGuardOld0 = string;
+type __semverGuardSame0 = (<T>() => T extends __semverGuardOld0 ? 1 : 2) extends (<T>() => T extends ID ? 1 : 2) ? true : false;
+```
+
+Identity is structural for object types (member order and an interface vs. a type literal with the same members do not matter), but it does not merge intersections, so `{ a: A } & { b: B }` → `{ a: A; b: B }` is reported even though the two are interchangeable for most code. This errs on the side of reporting.
+
+Generic aliases (`type Box<T> = ...`), targets that are or contain `any`, and old targets that refer to names that no longer exist fall back to the text comparison (see [Text fallback](#type-compatibility-rules)). Aliases referenced inside signatures and properties are not expanded there: those positions compare the alias name, and a change to the alias's target is reported on the alias.
 
 ### Enums
 
@@ -430,7 +507,7 @@ With entry points, only entry modules are compared, so a change to a re-exported
 If the snapshot directory contains a `package.json` with an `exports` or `main` field, the public surface is **what the entry modules export**, and nothing else:
 
 1. Every target in `exports` is an entry point: the `"."` entry, every subpath (`"./utils"`), every condition (`types`, `import`, `require`, `default`, ...), and every item of a fallback array. Non-code targets such as `"./package.json"` are skipped. Without `exports`, `main`, `types` and `typings` are used (as in Node.js, `main` is ignored when `exports` is present).
-2. Each target is mapped to a TypeScript source in the snapshot. Targets usually point at compiled output, so semver-guard tries, in order: a `.ts`/`.mts`/`.cts` file at the same path (`./index.js` -> `index.ts`); the same path moved from the build directory to the source directory, using `outDir` and `rootDir` from `tsconfig.json` when present and otherwise `dist`, `lib`, `build` or `out` -> `src` or the root (`./dist/index.js` -> `src/index.ts`); and finally a declaration file next to the target (`./types/index.js` -> `types/index.d.ts`). Extensionless and directory targets also try `index.ts`.
+2. Each target is mapped to a TypeScript source in the snapshot. Targets usually point at compiled output, so semver-guard tries, in order: a `.ts`/`.tsx`/`.mts`/`.cts` file at the same path (`./index.js` -> `index.ts`, or `index.tsx` if there is no `index.ts`; `./button.jsx` -> `button.tsx`); the same path moved from the build directory to the source directory, using `outDir` and `rootDir` from `tsconfig.json` when present and otherwise `dist`, `lib`, `build` or `out` -> `src` or the root (`./dist/index.js` -> `src/index.ts`); and finally a declaration file next to the target (`./types/index.js` -> `types/index.d.ts`). Extensionless and directory targets also try `.tsx`, `index.ts` and `index.tsx`.
 3. The exports of the resolved entry modules are compared, following re-exports (`export *`, `export { x } from`, `export * as ns from`, imports that are exported again) into any module they reach. Modules **not reachable** from an entry point through imports, re-exports, `import()` types, `require` or `/// <reference path>` are ignored, so internal helpers, tests and scripts in the same directory can change freely.
 
 Because exports are keyed by the entry module, **moving a declaration to another file is not a breaking change** as long as the same entry point still exports it. Removing it from the entry point is still reported, as `export-removed` at the entry module.
@@ -441,20 +518,23 @@ Targets that cannot be mapped are skipped as long as at least one target resolve
 
 ## What gets scanned
 
-- Every `.ts`, `.mts` and `.cts` file under the directory, including `.d.ts` files, recursively.
+- Every `.ts`, `.tsx`, `.mts` and `.cts` file under the directory, including `.d.ts` files, recursively. `.js`, `.jsx` and other files are ignored.
 - `node_modules` and any directory starting with `.` are skipped.
 - Only modules (files with at least one `import` or `export`) contribute exports. Global script files are ignored.
 - With `package.json` entry points, only the entry modules contribute exports, and only modules reachable from them are counted (see above). All files are still type-checked together.
-- Both snapshots are type-checked with the same fixed settings (`strict: true`, ES2022, bundler module resolution), not the package's own `tsconfig.json`, so inferred types are computed the same way on both sides. Type errors in the snapshots do not stop the comparison.
+- Both snapshots are type-checked with the same fixed settings (`strict: true`, ES2022, bundler module resolution, `jsx: react-jsx`), not the package's own `tsconfig.json`, so inferred types are computed the same way on both sides. Type errors in the snapshots do not stop the comparison.
 
 ## Current limitations
 
 - **Entry-point limits.** Subpath patterns (`"./features/*": "./dist/features/*.js"`) are not expanded; if they are the only targets, the snapshot falls back to every module. Entry modules are keyed by their source file path, not by their subpath, so moving an entry module itself (changing `"."` from `src/index.ts` to `src/main.ts`) is reported as removing everything it exported. `typesVersions` and `imports` (`#internal`) are not read. Inferred types that the compiler can only print as `import("src/x").Foo` change text when `Foo` moves to another file. In the fallback mode (no usable entry points) every module counts as public, as before, and moving a declaration between files is still reported as a removal.
 - **Git refs.** Refs come from the repository that contains the current directory, and the compared directory is the current directory at each ref (a different subdirectory per side is not supported; use a worktree and `--from <dir>` for that). Dependencies are taken from the current `node_modules` for both refs. Submodule and Git LFS contents are not included.
-- **Text comparison outside signatures and properties.** Type aliases, exported variable types, type parameter constraints and defaults, and `extends` clauses are still compared by text, so widening a type alias or a variable type is reported, and `Array<string>` vs `string[]` counts as a change there. Changed types inside signatures and properties also fall back to text when the checker cannot decide (see [Text fallback](#type-compatibility-rules)); in particular, renaming a referenced type (so that the old name no longer exists) is still reported in every signature that uses it.
+- **Text comparison outside signatures, properties and aliases.** Exported variable types, type parameter constraints and defaults, `extends` clauses and generic type alias targets are still compared by text, so widening a variable type is reported, and `Array<string>` vs `string[]` counts as a change there. Changed types inside signatures, properties and aliases also fall back to text when the checker cannot decide (see [Text fallback](#type-compatibility-rules)); in particular, renaming a referenced type (so that the old name no longer exists) is still reported in every signature that uses it.
+- **Alias identity is strict.** Mutually assignable but not identical targets are reported, including an intersection replaced by the equivalent single object type (see [Type aliases](#type-aliases)).
+- **Non-exported types are only expanded one level, and only as parameter types.** A non-exported `Props` type used directly as a parameter is compared by its members; a non-exported type used as a return type, a property type, or nested inside another type (`props: Props[]`, `Partial<Props>`, a member of `Props` whose type is another non-exported type) is still compared by name, so changes to its members are not seen. Renaming a non-exported parameter type is reported (the old name no longer resolves), even if its members are unchanged. Props declared in another module and imported count as exported from that module and are compared there (in the fallback mode) or not at all (with entry points, if the entry point does not export them).
+- **Component typing styles.** Components typed through their variable (`export const Button: React.FC<ButtonProps> = ...`) are exported variables, compared by the text of the annotation, so their props are not compared by the parameter rule; use a function or an arrow function with an annotated parameter. Class components are compared as classes. `defaultProps`, `forwardRef`/`memo` wrappers (`export const Button = memo(...)`) and the element types a component renders are not inspected beyond the exported value's type.
 - **Compatibility is checked per position.** Each changed parameter or return type is checked on its own, within the overload it belongs to. Type parameter constraints and defaults are still compared by text, so widening a constraint (`T extends string` → `T extends string | number`) is reported.
 - **Parameter matching is positional.** Inserting an optional parameter in the middle is reported as changes to the parameters that follow it.
-- **Not inspected yet:** `this` parameters, `implements` clauses, `declare module 'x'` / `declare global` augmentations, `export =` objects beyond their overall type, JSX (`.tsx`) files, and JavaScript files with JSDoc types.
+- **Not inspected yet:** `this` parameters, `implements` clauses, `declare module 'x'` / `declare global` augmentations, `export =` objects beyond their overall type, and JavaScript (`.js`/`.jsx`) files with JSDoc types.
 - **Baseline matching is exact.** Entries match on `code`, `export`, `member` and optionally `file`; there are no wildcards or patterns, and an accepted change stays accepted even if it changes again in a different way under the same code (for example, a second, different signature change to an accepted function).
 
 ## Development
@@ -479,7 +559,8 @@ Project layout:
 | `src/run.ts` / `src/cli.ts` | Argument parsing, exit codes, and the executable entry point. |
 | `src/model.ts` | Types shared by the modules above. |
 | `fixtures/before`, `fixtures/after` | Two versions of a small package used by the tests and the examples above. |
-| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback). |
+| `fixtures/components-before`, `fixtures/components-after` | Two versions of a small `.tsx` component package (widened props, narrowed props, a removed component, internal changes). |
+| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback), `tsx.test.ts` (`.tsx` files, component props and the component fixtures), `alias.test.ts` (type alias identity and its fallback). |
 
 The tests in `cli.test.ts` that run `dist/cli.js` as a separate process are skipped until `npm run build` has been run. CI always builds first.
 

@@ -16,6 +16,8 @@ export interface EntryPoints {
 const COMMON_OUT_DIRS = ['dist', 'lib', 'build', 'out'];
 /** Targets that are not code, such as `"./package.json": "./package.json"`. */
 const NON_CODE = /\.(json|css|scss|wasm|node|map|txt|md)$/i;
+/** TypeScript source paths, as opposed to compiled `.js`/`.jsx` targets. */
+const TS_SOURCE = /\.(?:[mc]?ts|tsx)$/;
 
 /**
  * Reads `<root>/package.json` and maps every target of its `exports` field (or,
@@ -110,22 +112,28 @@ function mapTarget(
   return candidates.find((candidate) => isSourceFile(candidate));
 }
 
-/** Non-declaration TypeScript files that a (possibly compiled) path corresponds to. */
+/** Non-declaration TypeScript files (including `.tsx`) that a (possibly compiled) path corresponds to. */
 function sourceCandidates(rel: string): string[] {
   const stem = stripDeclaration(rel);
-  if (stem !== undefined) return [`${stem.base}${stem.ext}`];
-  if (/\.[mc]?ts$/.test(rel)) return [rel];
-  const js = /^(.*)\.([mc]?)jsx?$/.exec(rel);
-  if (js) return [`${js[1]}.${js[2]}ts`];
+  if (stem !== undefined) {
+    return stem.ext === '.ts' ? [`${stem.base}.ts`, `${stem.base}.tsx`] : [`${stem.base}${stem.ext}`];
+  }
+  if (TS_SOURCE.test(rel)) return [rel];
+  const js = /^(.*)\.([mc]?)js(x?)$/.exec(rel);
+  if (js) {
+    if (js[2] !== '') return [`${js[1]}.${js[2]}ts`];
+    // `tsc` compiles .tsx to .js (or .jsx with `jsx: preserve`).
+    return js[3] === 'x' ? [`${js[1]}.tsx`, `${js[1]}.ts`] : [`${js[1]}.ts`, `${js[1]}.tsx`];
+  }
   // Extensionless or directory targets.
-  return [`${rel}.ts`, `${rel}.mts`, `${rel}.cts`, joinRel(rel, 'index.ts')];
+  return [`${rel}.ts`, `${rel}.tsx`, `${rel}.mts`, `${rel}.cts`, joinRel(rel, 'index.ts'), joinRel(rel, 'index.tsx')];
 }
 
 function declarationCandidates(rel: string): string[] {
   if (stripDeclaration(rel) !== undefined) return [rel];
   const js = /^(.*)\.([mc]?)jsx?$/.exec(rel);
   if (js) return [`${js[1]}.d.${js[2]}ts`];
-  if (/\.[mc]?ts$/.test(rel)) return [];
+  if (TS_SOURCE.test(rel)) return [];
   return [`${rel}.d.ts`, joinRel(rel, 'index.d.ts')];
 }
 

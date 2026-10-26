@@ -1,6 +1,6 @@
 {
   "name": "semver-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Catch breaking API changes in a TypeScript package before you release them as a minor or patch version.",
   "type": "module",
   "bin": {

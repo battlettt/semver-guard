@@ -214,7 +214,10 @@ function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit, types:
       case 'type': {
         const next = newShape as typeof oldShape;
         compareTypeParamsAndEmit(oldShape.typeParams, next.typeParams, emit);
-        if (oldShape.type !== next.type) {
+        // Consumers both read and supply values of an alias type, and use it
+        // in their own type-level code, so a changed target must be an
+        // identical type (see `Variance`).
+        if (!compatible(types, oldShape.type, next.type, next.declaration, 'type', 'identical')) {
           emit('type-changed', 'type alias declaration changed', {
             before: oldShape.type,
             after: next.type,
@@ -472,6 +475,16 @@ function signatureReasons(
     if (param.name !== next.name) reasons.push(`parameter ${param.name} was renamed to ${next.name}`);
     if (!compatible(types, param.type, next.type, current.declaration, i, rules.params)) {
       reasons.push(`type of parameter ${next.name} changed from ${param.type} to ${next.type}`);
+    } else if (
+      param.type === next.type &&
+      param.structure !== undefined &&
+      next.structure !== undefined &&
+      !compatible(types, param.structure, next.structure, current.declaration, i, rules.params)
+    ) {
+      // Same name, but it refers to a non-exported type whose members changed.
+      reasons.push(
+        `type of parameter ${next.name} (${next.type}) changed from ${param.structure} to ${next.structure}`,
+      );
     }
     if (param.optional && !next.optional && !next.rest) {
       reasons.push(`parameter ${next.name} became required`);
