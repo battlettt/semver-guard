@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import ts from 'typescript';
+import { resolveEntryPoints, type EntryPoints } from './entrypoints.js';
 import type {
   ApiSurface,
   ClassShape,
@@ -80,8 +81,19 @@ export function findSourceFiles(root: string): string[] {
   return files;
 }
 
-/** Extracts the exported API surface of every TypeScript module under `rootDir`. */
-export function extractApi(rootDir: string): ApiSurface {
+export interface ExtractOptions {
+  /**
+   * When true (the default), a `package.json` with `exports` or `main` in the
+   * snapshot root limits the surface to what its entry points export. Set to
+   * false to treat every module as public.
+   */
+  entryPoints?: boolean;
+  /** How to name the snapshot in error messages. Defaults to `rootDir`. */
+  label?: string;
+}
+
+/** Validates a snapshot directory and returns its real path. */
+function snapshotRoot(rootDir: string, label = rootDir): string {
   let root: string;
   let stat: fs.Stats;
   try {
@@ -89,30 +101,141 @@ export function extractApi(rootDir: string): ApiSurface {
     root = fs.realpathSync(path.resolve(rootDir));
     stat = fs.statSync(root);
   } catch {
-    throw new SnapshotError(`directory not found: ${rootDir}`);
+    throw new SnapshotError(`directory not found: ${label}`);
   }
-  if (!stat.isDirectory()) throw new SnapshotError(`not a directory: ${rootDir}`);
+  if (!stat.isDirectory()) throw new SnapshotError(`not a directory: ${label}`);
+  return root;
+}
 
+/**
+ * Resolves the entry points declared in `<rootDir>/package.json` to source
+ * files in the snapshot, or returns `undefined` if there is no package.json,
+ * it has no `exports`/`main`, or none of its targets maps to a source file.
+ */
+export function findEntryPoints(rootDir: string): EntryPoints | undefined {
+  const root = snapshotRoot(rootDir);
+  const sources = new Set(findSourceFiles(root).map((f) => toPosix(path.relative(root, f))));
+  return resolveEntryPoints(root, (rel) => sources.has(rel));
+}
+
+/**
+ * Extracts the exported API surface of a snapshot: by default the exports of
+ * its package.json entry points, or of every TypeScript module under
+ * `rootDir` if there are none.
+ */
+export function extractApi(rootDir: string, options: ExtractOptions = {}): ApiSurface {
+  const root = snapshotRoot(rootDir, options.label);
   const files = findSourceFiles(root);
   if (files.length === 0) {
-    throw new SnapshotError(`no TypeScript (.ts) files found under ${rootDir}`);
+    throw new SnapshotError(`no TypeScript (.ts) files found under ${options.label ?? rootDir}`);
   }
+  const relOf = (file: string) => toPosix(path.relative(root, file));
+  const sources = new Set(files.map(relOf));
+  const entryPoints =
+    options.entryPoints === false ? undefined : resolveEntryPoints(root, (rel) => sources.has(rel));
 
-  const program = ts.createProgram({ rootNames: files, options: COMPILER_OPTIONS, host: createHost() });
+  const host = createHost();
+  const program = ts.createProgram({ rootNames: files, options: COMPILER_OPTIONS, host });
   const extractor = new Extractor(program.getTypeChecker(), root);
   const exports: ExportEntry[] = [];
   const relFiles: string[] = [];
 
-  for (const file of files) {
-    const sourceFile = program.getSourceFile(file);
-    if (!sourceFile) continue;
-    const rel = toPosix(path.relative(root, file));
-    relFiles.push(rel);
-    exports.push(...extractor.moduleExports(sourceFile, rel));
+  if (entryPoints) {
+    const entryFiles = entryPoints.files.map((rel) => path.join(root, rel));
+    const reachable = reachableFiles(program, entryFiles, new Set(files), host);
+    for (const file of files) {
+      if (reachable.has(file)) relFiles.push(relOf(file));
+    }
+    for (const file of entryFiles) {
+      const sourceFile = program.getSourceFile(file);
+      if (sourceFile) exports.push(...extractor.moduleExports(sourceFile, relOf(file)));
+    }
+  } else {
+    for (const file of files) {
+      const sourceFile = program.getSourceFile(file);
+      if (!sourceFile) continue;
+      const rel = relOf(file);
+      relFiles.push(rel);
+      exports.push(...extractor.moduleExports(sourceFile, rel));
+    }
   }
 
   exports.sort((a, b) => compareStrings(a.file, b.file) || compareStrings(a.name, b.name));
-  return { root, files: relFiles, exports };
+  const surface: ApiSurface = { root, files: relFiles, exports };
+  if (entryPoints) surface.entryPoints = entryPoints.files;
+  return surface;
+}
+
+/**
+ * Follows imports, re-exports, `import()` types, `require` calls and
+ * `/// <reference path>` directives from `entries`, and returns every scanned
+ * source file (from `sources`) that is reached.
+ */
+function reachableFiles(
+  program: ts.Program,
+  entries: string[],
+  sources: Set<string>,
+  host: ts.CompilerHost,
+): Set<string> {
+  const byPosix = new Map([...sources].map((f) => [toPosix(f), f]));
+  const reached = new Set<string>();
+  const queue = [...entries];
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (reached.has(file)) continue;
+    reached.add(file);
+    const sourceFile = program.getSourceFile(file);
+    if (!sourceFile) continue;
+    const targets: string[] = [];
+    for (const specifier of moduleSpecifiers(sourceFile)) {
+      const resolved = ts.resolveModuleName(specifier, file, COMPILER_OPTIONS, host).resolvedModule;
+      if (resolved) targets.push(resolved.resolvedFileName);
+    }
+    for (const ref of sourceFile.referencedFiles) {
+      targets.push(path.resolve(path.dirname(file), ref.fileName));
+    }
+    for (const target of targets) {
+      const source = byPosix.get(toPosix(path.resolve(target)));
+      if (source && !reached.has(source)) queue.push(source);
+    }
+  }
+  return reached;
+}
+
+/** Every module specifier used by a file. */
+function moduleSpecifiers(sourceFile: ts.SourceFile): string[] {
+  const specifiers: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) {
+      if (ts.isStringLiteral(node.moduleSpecifier)) specifiers.push(node.moduleSpecifier.text);
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference) &&
+      ts.isStringLiteral(node.moduleReference.expression)
+    ) {
+      specifiers.push(node.moduleReference.expression.text);
+    } else if (
+      ts.isImportTypeNode(node) &&
+      ts.isLiteralTypeNode(node.argument) &&
+      ts.isStringLiteral(node.argument.literal)
+    ) {
+      specifiers.push(node.argument.literal.text);
+    } else if (
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require')) &&
+      node.arguments.length > 0 &&
+      ts.isStringLiteralLike(node.arguments[0])
+    ) {
+      specifiers.push(node.arguments[0].text);
+    } else if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name)) {
+      // `declare module './x'` augments that module.
+      specifiers.push(node.name.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return specifiers;
 }
 
 class Extractor {

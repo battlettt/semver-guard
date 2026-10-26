@@ -126,8 +126,18 @@ export interface ExportEntry {
 
 export interface ApiSurface {
   root: string;
+  /**
+   * Modules that make up the surface. With entry points, these are the
+   * modules reachable from them; otherwise every source file.
+   */
   files: string[];
   exports: ExportEntry[];
+  /**
+   * Entry modules resolved from `package.json` (`exports`, or `main`/`types`),
+   * relative to the root. When set, `exports` only lists what these modules
+   * export. Absent when every module counts as public (the fallback).
+   */
+  entryPoints?: string[];
 }
 
 export type ChangeCode =
@@ -170,6 +180,8 @@ export interface CompareResult {
     filesAfter: number;
     exportsBefore: number;
     exportsAfter: number;
+    /** Changes suppressed by a baseline file. Only present when a baseline was used. */
+    accepted?: number;
   };
   changes: BreakingChange[];
 }

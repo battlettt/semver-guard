@@ -12,8 +12,13 @@ export function formatTable(result: CompareResult): string {
   const compared = `${summary.exportsBefore} export${summary.exportsBefore === 1 ? '' : 's'} in ${summary.filesBefore} file${summary.filesBefore === 1 ? '' : 's'}`;
   const header = `semver-guard: ${result.from} -> ${result.to} (${compared} checked)`;
 
+  const accepted =
+    summary.accepted !== undefined && summary.accepted > 0
+      ? `\n${summary.accepted} accepted breaking change${summary.accepted === 1 ? ' was' : 's were'} suppressed by the baseline.`
+      : '';
+
   if (result.changes.length === 0) {
-    return `${header}\n\nNo breaking changes found.\n`;
+    return `${header}\n\nNo breaking changes found.${accepted}\n`;
   }
 
   const headings = ['CHANGE', 'EXPORT', 'FILE', 'DETAILS'];
@@ -40,7 +45,7 @@ export function formatTable(result: CompareResult): string {
   const count = result.changes.length;
   lines.push(
     '',
-    `${count} breaking change${count === 1 ? '' : 's'} found. Releasing this as a minor or patch version would break consumers; bump the major version.`,
+    `${count} breaking change${count === 1 ? '' : 's'} found. Releasing this as a minor or patch version would break consumers; bump the major version.${accepted}`,
   );
   return lines.join('\n') + '\n';
 }
