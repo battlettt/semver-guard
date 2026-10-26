@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Smoke-test the CLI against the fixtures
+        run: |
+          set +e
+          node dist/cli.js compare --from fixtures/after --to fixtures/after
+          test $? -eq 0 || exit 1
+          node dist/cli.js compare --from fixtures/before --to fixtures/after --format json > report.json
+          test $? -eq 1 || exit 1
+          node -e "const r = require('./report.json'); if (r.summary.breaking !== 6) process.exit(1)"

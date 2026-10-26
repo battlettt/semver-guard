@@ -1,0 +1,47 @@
+{
+  "name": "semver-guard",
+  "version": "0.1.0",
+  "description": "Catch breaking API changes in a TypeScript package before you release them as a minor or patch version.",
+  "type": "module",
+  "bin": {
+    "semver-guard": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "semver",
+    "typescript",
+    "api",
+    "breaking-changes",
+    "cli",
+    "release"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "typescript": "~6.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "vitest": "^3.2.4"
+  }
+}

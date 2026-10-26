@@ -1,0 +1,511 @@
+import type {
+  ApiSurface,
+  BreakingChange,
+  ChangeCode,
+  ClassShape,
+  CompareResult,
+  EnumShape,
+  ExportEntry,
+  InterfaceShape,
+  Member,
+  Shape,
+  ShapeKind,
+  Signature,
+  TypeParam,
+} from './model.js';
+
+type Emit = (
+  code: ChangeCode,
+  message: string,
+  extra?: { member?: string; before?: string; after?: string },
+) => void;
+
+/**
+ * Compares two API surfaces and returns every breaking change found when
+ * moving from `before` to `after`. `labels` are the snapshot paths shown in
+ * the report (typically the paths given on the command line).
+ */
+export function compareSurfaces(
+  before: ApiSurface,
+  after: ApiSurface,
+  labels: { from: string; to: string } = { from: before.root, to: after.root },
+): CompareResult {
+  const changes: BreakingChange[] = [];
+  const beforeByKey = new Map(before.exports.map((e) => [entryKey(e), e]));
+  const afterByKey = new Map(after.exports.map((e) => [entryKey(e), e]));
+  const removed = new Set<string>();
+  /** Declaration key -> modules whose shape changes were folded into that declaration's report. */
+  const reexporters = new Map<string, string[]>();
+
+  for (const old of before.exports) {
+    if (hasRemovedParent(old, removed)) continue;
+    const current = afterByKey.get(entryKey(old));
+    const kind = old.shapes[0].kind;
+    const emit: Emit = (code, message, extra = {}) => {
+      changes.push({
+        code,
+        file: old.file,
+        export: old.name,
+        exportKind: kind,
+        member: extra.member,
+        message,
+        before: extra.before,
+        after: extra.after,
+      });
+    };
+
+    if (!current) {
+      removed.add(entryKey(old));
+      emit('export-removed', `${describeKinds(old.shapes)} ${old.name} was removed`);
+      continue;
+    }
+
+    // A re-export of a declaration that is compared at its own module (in both
+    // versions) is reported once, at the declaration, listing this module.
+    const origin = old.origin && originKey(old.origin);
+    if (
+      origin &&
+      current.origin &&
+      origin === originKey(current.origin) &&
+      beforeByKey.has(origin) &&
+      afterByKey.has(origin)
+    ) {
+      const list = reexporters.get(origin) ?? [];
+      list.push(old.name === old.origin!.name ? old.file : `${old.file} (as ${old.name})`);
+      reexporters.set(origin, list);
+      continue;
+    }
+    compareEntry(old, current, emit);
+  }
+
+  for (const change of changes) {
+    const via = reexporters.get(`${change.file}#${change.export}`);
+    if (via && change.code !== 'export-removed') change.reexportedBy = [...via];
+  }
+
+  return {
+    from: labels.from,
+    to: labels.to,
+    summary: {
+      breaking: changes.length,
+      filesBefore: before.files.length,
+      filesAfter: after.files.length,
+      exportsBefore: before.exports.length,
+      exportsAfter: after.exports.length,
+    },
+    changes,
+  };
+}
+
+function entryKey(entry: ExportEntry): string {
+  return `${entry.file}#${entry.name}`;
+}
+
+function originKey(origin: { file: string; name: string }): string {
+  return `${origin.file}#${origin.name}`;
+}
+
+/** A removed namespace is reported once, not once per nested export. */
+function hasRemovedParent(entry: ExportEntry, removed: Set<string>): boolean {
+  const parts = entry.name.split('.');
+  for (let i = 1; i < parts.length; i++) {
+    if (removed.has(`${entry.file}#${parts.slice(0, i).join('.')}`)) return true;
+  }
+  return false;
+}
+
+function describeKinds(shapes: Shape[]): string {
+  return shapes.map((s) => kindLabel(s.kind)).join(' + ');
+}
+
+function kindLabel(kind: ShapeKind): string {
+  return kind === 'type' ? 'type alias' : kind === 'reexport' ? 're-export' : kind;
+}
+
+function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit): void {
+  for (const oldShape of old.shapes) {
+    const newShape = current.shapes.find((s) => s.kind === oldShape.kind);
+    if (!newShape) {
+      emit(
+        'kind-changed',
+        `${kindLabel(oldShape.kind)} ${old.name} is now a ${describeKinds(current.shapes)}`,
+        { before: kindLabel(oldShape.kind), after: describeKinds(current.shapes) },
+      );
+      continue;
+    }
+    switch (oldShape.kind) {
+      case 'function': {
+        const reasons = signatureSetReasons(oldShape.signatures, (newShape as typeof oldShape).signatures);
+        if (reasons.length > 0) {
+          emit('signature-changed', reasons.join('; '), {
+            before: oldShape.signatures.map(formatSignature).join(' | '),
+            after: (newShape as typeof oldShape).signatures.map(formatSignature).join(' | '),
+          });
+        }
+        break;
+      }
+      case 'class':
+        compareClass(oldShape, newShape as ClassShape, emit);
+        break;
+      case 'interface':
+        compareInterface(oldShape, newShape as InterfaceShape, emit);
+        break;
+      case 'type': {
+        const next = newShape as typeof oldShape;
+        compareTypeParamsAndEmit(oldShape.typeParams, next.typeParams, emit);
+        if (oldShape.type !== next.type) {
+          emit('type-changed', 'type alias declaration changed', {
+            before: oldShape.type,
+            after: next.type,
+          });
+        }
+        break;
+      }
+      case 'enum':
+        compareEnum(oldShape, newShape as EnumShape, emit);
+        break;
+      case 'variable': {
+        const next = newShape as typeof oldShape;
+        if (oldShape.type !== next.type) {
+          emit('type-changed', 'type of exported variable changed', {
+            before: oldShape.type,
+            after: next.type,
+          });
+        }
+        break;
+      }
+      case 'reexport': {
+        const next = newShape as typeof oldShape;
+        if (oldShape.target !== next.target) {
+          emit('type-changed', 're-export target changed', {
+            before: oldShape.target,
+            after: next.target,
+          });
+        }
+        break;
+      }
+      case 'namespace':
+        // Namespace members are compared as their own dotted exports.
+        break;
+    }
+  }
+}
+
+function compareClass(old: ClassShape, current: ClassShape, emit: Emit): void {
+  if (!old.isAbstract && current.isAbstract) {
+    emit('modifier-changed', 'class became abstract and can no longer be instantiated', {
+      before: 'class',
+      after: 'abstract class',
+    });
+  }
+  compareTypeParamsAndEmit(old.typeParams, current.typeParams, emit);
+  if (old.extends !== undefined && old.extends !== current.extends) {
+    emit(
+      'heritage-changed',
+      current.extends === undefined
+        ? `no longer extends ${old.extends}`
+        : `base class changed from ${old.extends} to ${current.extends}`,
+      { before: old.extends, after: current.extends },
+    );
+  }
+
+  const rank = { public: 0, protected: 1, private: 2 };
+  if (rank[current.constructorVisibility] > rank[old.constructorVisibility]) {
+    emit(
+      'modifier-changed',
+      `constructor visibility reduced from ${old.constructorVisibility} to ${current.constructorVisibility}`,
+      { member: 'constructor', before: old.constructorVisibility, after: current.constructorVisibility },
+    );
+  } else if (old.constructorVisibility !== 'private') {
+    const reasons = signatureSetReasons(
+      old.constructors.map(withoutReturnType),
+      current.constructors.map(withoutReturnType),
+    );
+    if (reasons.length > 0) {
+      emit('signature-changed', reasons.join('; '), {
+        member: 'constructor',
+        before: old.constructors.map(formatConstructor).join(' | '),
+        after: current.constructors.map(formatConstructor).join(' | '),
+      });
+    }
+  }
+
+  compareMembers(old.members, current.members, 'class', emit);
+}
+
+function compareInterface(old: InterfaceShape, current: InterfaceShape, emit: Emit): void {
+  compareTypeParamsAndEmit(old.typeParams, current.typeParams, emit);
+  for (const base of old.extends) {
+    if (!current.extends.includes(base)) {
+      emit('heritage-changed', `no longer extends ${base}`, {
+        before: old.extends.join(', '),
+        after: current.extends.join(', ') || '(none)',
+      });
+    }
+  }
+  compareMembers(old.members, current.members, 'interface', emit);
+}
+
+function compareEnum(old: EnumShape, current: EnumShape, emit: Emit): void {
+  if (!old.isConst && current.isConst) {
+    emit('modifier-changed', 'enum became a const enum and no longer exists at runtime', {
+      before: 'enum',
+      after: 'const enum',
+    });
+  }
+  const values = new Map(current.members.map((m) => [m.name, m]));
+  for (const member of old.members) {
+    const next = values.get(member.name);
+    if (!next) {
+      emit('enum-member-removed', `enum member ${member.name} was removed`, {
+        member: member.name,
+        before: member.value,
+      });
+    } else if (member.value !== undefined && next.value !== undefined && member.value !== next.value) {
+      emit('enum-member-changed', `value of enum member ${member.name} changed`, {
+        member: member.name,
+        before: member.value,
+        after: next.value,
+      });
+    }
+  }
+}
+
+function compareMembers(
+  oldMembers: Member[],
+  newMembers: Member[],
+  owner: 'class' | 'interface',
+  emit: Emit,
+): void {
+  const byKey = new Map(newMembers.map((m) => [m.key, m]));
+  const oldKeys = new Set(oldMembers.map((m) => m.key));
+
+  for (const member of oldMembers) {
+    const next = byKey.get(member.key);
+    if (!next) {
+      emit('member-removed', `${memberLabel(member)} was removed`, {
+        member: member.key,
+        before: formatMember(member),
+      });
+      continue;
+    }
+    const reasons = memberReasons(member, next, owner);
+    if (reasons.length > 0) {
+      emit('member-changed', reasons.join('; '), {
+        member: member.key,
+        before: formatMember(member),
+        after: formatMember(next),
+      });
+    }
+  }
+
+  for (const member of newMembers) {
+    if (oldKeys.has(member.key)) continue;
+    if (owner === 'interface') {
+      const required =
+        member.kind === 'call' ||
+        member.kind === 'construct' ||
+        member.kind === 'index' ||
+        !member.optional;
+      if (required) {
+        emit(
+          'member-added',
+          `required ${memberLabel(member)} was added; existing implementations and object literals of this interface no longer type-check`,
+          { member: member.key, after: formatMember(member) },
+        );
+      }
+    } else if (member.isAbstract) {
+      emit(
+        'member-added',
+        `abstract ${memberLabel(member)} was added; existing subclasses must now implement it`,
+        { member: member.key, after: formatMember(member) },
+      );
+    }
+  }
+}
+
+function memberReasons(old: Member, current: Member, owner: 'class' | 'interface'): string[] {
+  if (old.kind !== current.kind) return [`changed from ${old.kind} to ${current.kind}`];
+  const reasons: string[] = [];
+  if (old.visibility === 'public' && current.visibility === 'protected') {
+    reasons.push('visibility reduced from public to protected');
+  }
+  if (!old.optional && current.optional) reasons.push('became optional');
+  if (owner === 'interface' && old.optional && !current.optional) reasons.push('became required');
+  if (!old.readonly && current.readonly) reasons.push('became readonly');
+  if (owner === 'class' && !old.isAbstract && current.isAbstract) reasons.push('became abstract');
+  if (old.type !== undefined && old.type !== current.type) {
+    reasons.push(`type changed from ${old.type} to ${current.type}`);
+  }
+  if (old.signatures && current.signatures) {
+    reasons.push(...signatureSetReasons(old.signatures, current.signatures));
+  }
+  return reasons;
+}
+
+/**
+ * Every old signature (overload) must still be satisfied by at least one new
+ * signature. Returns the reasons for the first overload that is not.
+ */
+function signatureSetReasons(oldSigs: Signature[], newSigs: Signature[]): string[] {
+  const reasons: string[] = [];
+  for (const old of oldSigs) {
+    if (newSigs.length === 0) {
+      reasons.push(`signature ${formatSignature(old)} was removed`);
+      continue;
+    }
+    let best: string[] | undefined;
+    for (const candidate of newSigs) {
+      const r = signatureReasons(old, candidate);
+      if (best === undefined || r.length < best.length) best = r;
+      if (r.length === 0) break;
+    }
+    if (best && best.length > 0) {
+      if (oldSigs.length > 1 || newSigs.length > 1) {
+        reasons.push(`overload ${formatSignature(old)} is no longer supported (${best.join(', ')})`);
+      } else {
+        reasons.push(...best);
+      }
+    }
+  }
+  return reasons;
+}
+
+function signatureReasons(old: Signature, current: Signature): string[] {
+  const reasons = typeParamReasons(old.typeParams, current.typeParams);
+
+  old.params.forEach((param, i) => {
+    const next = current.params[i];
+    if (!next) {
+      reasons.push(`${param.rest ? 'rest parameter' : 'parameter'} ${param.name} was removed`);
+      return;
+    }
+    if (param.name !== next.name) reasons.push(`parameter ${param.name} was renamed to ${next.name}`);
+    if (param.type !== next.type) {
+      reasons.push(`type of parameter ${next.name} changed from ${param.type} to ${next.type}`);
+    }
+    if (param.optional && !next.optional && !next.rest) {
+      reasons.push(`parameter ${next.name} became required`);
+    }
+    if (param.rest !== next.rest) {
+      reasons.push(
+        next.rest
+          ? `parameter ${next.name} became a rest parameter`
+          : `parameter ${next.name} is no longer a rest parameter`,
+      );
+    }
+  });
+  for (const added of current.params.slice(old.params.length)) {
+    if (!added.optional && !added.rest) reasons.push(`required parameter ${added.name} was added`);
+  }
+
+  if (old.returnType !== current.returnType) {
+    reasons.push(`return type changed from ${old.returnType} to ${current.returnType}`);
+  }
+  return reasons;
+}
+
+function typeParamReasons(old: TypeParam[], current: TypeParam[]): string[] {
+  const reasons: string[] = [];
+  old.forEach((param, i) => {
+    const next = current[i];
+    if (!next) {
+      reasons.push(`type parameter ${param.name} was removed`);
+      return;
+    }
+    if (param.constraint !== next.constraint) {
+      reasons.push(
+        `constraint of type parameter ${next.name} changed from ${param.constraint ?? '(none)'} to ${next.constraint ?? '(none)'}`,
+      );
+    }
+    if (param.default !== undefined && param.default !== next.default) {
+      reasons.push(
+        `default of type parameter ${next.name} changed from ${param.default} to ${next.default ?? '(none)'}`,
+      );
+    }
+  });
+  for (const added of current.slice(old.length)) {
+    if (added.default === undefined) reasons.push(`required type parameter ${added.name} was added`);
+  }
+  return reasons;
+}
+
+function compareTypeParamsAndEmit(old: TypeParam[], current: TypeParam[], emit: Emit): void {
+  const reasons = typeParamReasons(old, current);
+  if (reasons.length > 0) {
+    emit('type-parameters-changed', reasons.join('; '), {
+      before: formatTypeParams(old) || '(none)',
+      after: formatTypeParams(current) || '(none)',
+    });
+  }
+}
+
+function withoutReturnType(signature: Signature): Signature {
+  return { ...signature, returnType: '' };
+}
+
+function memberLabel(member: Member): string {
+  switch (member.kind) {
+    case 'call':
+      return 'call signature';
+    case 'construct':
+      return 'construct signature';
+    case 'index':
+      return `index signature ${member.key}`;
+    default:
+      return `${member.kind} ${member.key}`;
+  }
+}
+
+export function formatTypeParams(params: TypeParam[]): string {
+  if (params.length === 0) return '';
+  const parts = params.map(
+    (p) =>
+      p.name +
+      (p.constraint !== undefined ? ` extends ${p.constraint}` : '') +
+      (p.default !== undefined ? ` = ${p.default}` : ''),
+  );
+  return `<${parts.join(', ')}>`;
+}
+
+function formatParams(signature: Signature): string {
+  const params = signature.params.map(
+    (p) => `${p.rest ? '...' : ''}${p.name}${p.optional && !p.rest ? '?' : ''}: ${p.type}`,
+  );
+  return `(${params.join(', ')})`;
+}
+
+export function formatSignature(signature: Signature): string {
+  return `${formatTypeParams(signature.typeParams)}${formatParams(signature)}: ${signature.returnType}`;
+}
+
+function formatConstructor(signature: Signature): string {
+  return `new ${formatParams(signature)}`;
+}
+
+function formatMember(member: Member): string {
+  const modifiers = [
+    member.visibility === 'protected' ? 'protected' : '',
+    member.isStatic ? 'static' : '',
+    member.isAbstract ? 'abstract' : '',
+    member.readonly ? 'readonly' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const prefix = modifiers ? `${modifiers} ` : '';
+  const optional = member.optional ? '?' : '';
+  switch (member.kind) {
+    case 'property':
+      return `${prefix}${member.name}${optional}: ${member.type}`;
+    case 'index':
+      return `${prefix}${member.name}: ${member.type}`;
+    case 'call':
+      return (member.signatures ?? []).map(formatSignature).join(' | ');
+    case 'construct':
+      return (member.signatures ?? []).map((s) => `new ${formatSignature(s)}`).join(' | ');
+    case 'method':
+      return (member.signatures ?? [])
+        .map((s) => `${prefix}${member.name}${optional}${formatSignature(s)}`)
+        .join(' | ');
+  }
+}
