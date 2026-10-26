@@ -33,3 +33,33 @@ jobs:
           node dist/cli.js compare --from fixtures/before --to fixtures/after --format json > report.json
           test $? -eq 1 || exit 1
           node -e "const r = require('./report.json'); if (r.summary.breaking !== 6) process.exit(1)"
+      - name: Smoke-test the CLI in git ref mode
+        run: |
+          set +e
+          cli="$GITHUB_WORKSPACE/dist/cli.js"
+          repo="$(mktemp -d)"
+          cd "$repo"
+          git init -q
+          git config user.name "semver-guard CI"
+          git config user.email "ci@example.invalid"
+          mkdir src
+          printf '%s\n' \
+            'export function greet(name: string): string { return `hi ${name}`; }' \
+            'export function parse(input: string): number { return Number(input); }' > src/index.ts
+          git add . && git commit -q -m "v1"
+          git tag v1
+          # Widening a parameter is safe; removing an export is breaking.
+          printf '%s\n' \
+            'export function greet(name: string | number): string { return `hi ${name}`; }' > src/index.ts
+          git commit -q -am "v2"
+          node "$cli" compare --from-ref v1 --to-ref v1
+          test $? -eq 0 || exit 1
+          node "$cli" compare --from-ref v1 --to-ref HEAD
+          test $? -eq 1 || exit 1
+          node "$cli" compare --from-ref v1 --to-ref HEAD --format json > report.json
+          test $? -eq 1 || exit 1
+          node -e "
+            const r = require('./report.json');
+            const ok = r.summary.breaking === 1 && r.changes[0].code === 'export-removed' && r.changes[0].export === 'parse';
+            if (!ok) { console.error(JSON.stringify(r, null, 2)); process.exit(1); }
+          "

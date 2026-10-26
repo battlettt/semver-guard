@@ -5,6 +5,7 @@ import { resolveEntryPoints, type EntryPoints } from './entrypoints.js';
 import type {
   ApiSurface,
   ClassShape,
+  DeclarationRef,
   EnumMember,
   EnumShape,
   ExportEntry,
@@ -24,7 +25,7 @@ const IGNORED_DIRS = new Set(['node_modules']);
  * Fixed compiler options used for both snapshots, so that inferred types are
  * computed the same way on each side of the comparison.
  */
-const COMPILER_OPTIONS: ts.CompilerOptions = {
+export const COMPILER_OPTIONS: ts.CompilerOptions = {
   target: ts.ScriptTarget.ES2022,
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
@@ -43,7 +44,7 @@ export class SnapshotError extends Error {}
 /** Parsed standard library files, shared between programs because they never change. */
 const libCache = new Map<string, ts.SourceFile>();
 
-function createHost(): ts.CompilerHost {
+export function createHost(): ts.CompilerHost {
   const host = ts.createCompilerHost(COMPILER_OPTIONS, true);
   const libDir = toPosix(path.dirname(host.getDefaultLibFileName(COMPILER_OPTIONS))) + '/';
   const getSourceFile = host.getSourceFile.bind(host);
@@ -481,6 +482,7 @@ class Extractor {
           isAbstract: false,
           visibility,
           type: this.nodeText(element.type),
+          declaration: declarationRef(element),
         });
         continue;
       }
@@ -552,6 +554,7 @@ class Extractor {
         kind: 'property',
         readonly: !setter,
         type: annotation ? this.nodeText(annotation) : this.declarationType(first),
+        declaration: declarationRef(getter ?? first),
       };
     }
 
@@ -565,6 +568,7 @@ class Extractor {
         : isClass
           ? this.declarationType(property)
           : 'any',
+      declaration: declarationRef(property),
     };
   }
 
@@ -585,6 +589,7 @@ class Extractor {
         isAbstract: false,
         visibility: hasModifier(param, ts.SyntaxKind.ProtectedKeyword) ? 'protected' : 'public',
         type: param.type ? this.nodeText(param.type) : this.declarationType(param),
+        declaration: declarationRef(param),
       });
     }
     return members;
@@ -646,7 +651,9 @@ class Extractor {
       decl?.type !== undefined
         ? this.nodeText(decl.type)
         : this.typeString(this.checker.getReturnTypeOfSignature(signature), decl);
-    return { typeParams, params, returnType };
+    const result: Signature = { typeParams, params, returnType };
+    if (decl) result.declaration = declarationRef(decl);
+    return result;
   }
 
   private typeParams(decls: ts.NodeArray<ts.TypeParameterDeclaration> | undefined): TypeParam[] {
@@ -672,6 +679,10 @@ class Extractor {
     // strip the snapshot root so both sides compare equal.
     return normalizeWhitespace(text.split(this.rootPrefix).join(''));
   }
+}
+
+function declarationRef(node: ts.Node): DeclarationRef {
+  return { file: node.getSourceFile().fileName, pos: node.pos, end: node.end, kind: node.kind };
 }
 
 function memberName(name: ts.PropertyName, extractor: Extractor): string {

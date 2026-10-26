@@ -285,7 +285,47 @@ if (filtered.changes.length > 0) console.log(formatTable(filtered));
 
 ## Breaking-change rules
 
-semver-guard compares **declarations as written**, using the TypeScript type checker only to fill in types that are not annotated (inferred return types, inferred variable and property types). Two types are considered equal when their printed text is equal, after removing comments and collapsing whitespace. It does not check whether a new type is assignable to the old one, so widening a parameter from `string` to `string | number` is reported even though it is safe for callers. These rules err on the side of reporting a change.
+semver-guard compares **declarations as written**. Types whose printed text is equal (after removing comments and collapsing whitespace) are always equal. When the type of a parameter, a return type, or the type of a class or interface property changes, the TypeScript type checker decides whether the change can break consumers, using the [compatibility rules](#type-compatibility-rules) below. Everything else (type aliases, exported variables, type parameter constraints and defaults, `extends` clauses) is compared by text. These rules err on the side of reporting a change.
+
+### Type compatibility rules
+
+A changed type is only reported if some consumer code that compiled against the old version could stop compiling. The type checker answers this by **assignability**, in the direction in which values flow:
+
+| Position | Allowed change | Rule | Example that is **not** reported | Example that **is** reported |
+| --- | --- | --- | --- | --- |
+| Parameter of a function, class method or constructor, or of an interface method | Widening | The old type must be assignable to the new type, so every argument callers pass today is still accepted. | `f(a: string)` → `f(a: string \| number)`<br>`f(mode: 'light' \| 'dark')` → `f(mode: 'light' \| 'dark' \| 'system')` | `f(a: string \| number)` → `f(a: string)` |
+| Return type of a function or class method, or the type of a `readonly` class property (including a getter without a setter) | Narrowing | The new type must be assignable to the old type, so every value callers receive is still something they handle. | `f(): string \| number` → `f(): string` | `f(): string` → `f(): string \| undefined` |
+| Interface method return type; parameters and return type of interface call and construct signatures; writable class properties; interface properties | None | Assignable in both directions (equivalent types), because consumers both read these and supply them (object literals, `implements`, assignments). | `p: string[]` → `p: Array<string>` | `p: string` → `p: string \| number` |
+
+Some changes that the text comparison of earlier versions reported are no longer reported, because the types are the same or compatible:
+
+```ts
+// before
+export interface Options { verbose: boolean }
+export declare function run(files: Array<string>, options: Options): string | number;
+
+// after: not reported
+export interface Options { verbose: boolean }
+export type Settings = Options;
+export declare function run(files: string[] | ReadonlySet<string>, options: Settings): string;
+```
+
+Interface method return types stay strict because a narrower return type breaks existing implementations that return the old, wider type. Interface method parameters may widen because TypeScript checks method parameters bivariantly, so existing implementations still compile.
+
+Each old overload only needs one compatible new signature, so merging `f(a: string)` and `f(a: number)` into a single `f(a: string | number)` is not reported.
+
+The rules for the number of parameters do not change: an added optional, defaulted or rest parameter is allowed, an added required parameter and a removed parameter are reported.
+
+**How it works.** For each changed type, semver-guard inserts the old type text next to the matching declaration in a copy of the new version (as an extra parameter or property) and asks the type checker whether it is assignable to the new type. Names in the old type are therefore resolved in the new version's scope, including imports and type parameters. The snapshots on disk are not modified.
+
+**Text fallback.** When the checker types are unavailable for a pair of types, semver-guard falls back to the text comparison for that pair and reports the change if the texts differ. This happens when:
+
+- the old type refers to a name that no longer exists in the new version (for example, a type that was renamed or deleted), or has any other type error in the new version's scope,
+- either type is or contains `any` (`any` is assignable in both directions, which would hide real changes),
+- the declaration cannot hold the inserted old type: an arrow function written without parentheses (`x => x`), a type predicate return type (`x is string`), or a signature that the checker synthesized without a declaration of its own,
+- the source file of the new declaration cannot be read.
+
+The fallback is silent, like the entry-point fallback: the reported change looks the same as any other. Library users can turn off the checker entirely with `compareSurfaces(before, after, labels, { typeComparison: 'text' })`, which restores the text comparison of earlier versions.
 
 ### Exports
 
@@ -308,11 +348,13 @@ Every signature (overload) of the old version must still exist in the new versio
 | --- | --- |
 | Parameter removed | **yes** |
 | Parameter renamed | **yes** (names show up in editor hints and docs and are often relied on, so this rule is deliberately strict) |
-| Parameter type changed | **yes** |
+| Parameter type changed so that it no longer accepts everything it accepted before (narrowed or unrelated) | **yes** |
+| Parameter type widened (e.g. `string` → `string \| number`, or a member added to a union) | no, see [compatibility rules](#type-compatibility-rules) |
 | Optional or defaulted parameter became required | **yes** |
 | Parameter became, or stopped being, a rest parameter | **yes** |
 | New **required** parameter | **yes** |
-| Return type changed (annotated or inferred) | **yes** |
+| Return type changed (annotated or inferred) so that it can return something it could not before (widened or unrelated) | **yes** |
+| Return type narrowed (e.g. `string \| number` → `string`) | no, except for interface methods and signatures, see [compatibility rules](#type-compatibility-rules) |
 | Type parameter removed, constraint changed, or default changed or removed | **yes** |
 | New type parameter **without** a default | **yes** |
 | New **optional**, defaulted or rest parameter at the end | no |
@@ -328,7 +370,7 @@ Public and protected members are part of the API (protected members matter to su
 | Change | Breaking? | Code |
 | --- | --- | --- |
 | Public/protected member removed, renamed, or made `private` | **yes** | `member-removed` |
-| Member type or method signature changed (rules above) | **yes** | `member-changed` |
+| Member type or method signature changed (rules above; a `readonly` property may narrow, a writable one must keep an equivalent type) | **yes** | `member-changed` |
 | Member became optional, `readonly` or `abstract`, or visibility reduced from public to protected | **yes** | `member-changed` |
 | Member changed from property to method or vice versa | **yes** | `member-changed` |
 | Constructor signature changed (rules above, including inherited constructors) | **yes** | `signature-changed` |
@@ -350,7 +392,7 @@ Interfaces are both *read* by consumers and *implemented* by consumers (object l
 | Change | Breaking? | Code |
 | --- | --- | --- |
 | Member removed | **yes** | `member-removed` |
-| Member type or method signature changed | **yes** | `member-changed` |
+| Member type or method signature changed (property types must stay equivalent; method parameters may widen; return types must stay equivalent) | **yes** | `member-changed` |
 | Optional member became required, or required member became optional | **yes** | `member-changed` |
 | Member became `readonly` | **yes** | `member-changed` |
 | New **required** member, call signature, construct signature or index signature | **yes** (existing implementations no longer type-check) | `member-added` |
@@ -409,7 +451,8 @@ Targets that cannot be mapped are skipped as long as at least one target resolve
 
 - **Entry-point limits.** Subpath patterns (`"./features/*": "./dist/features/*.js"`) are not expanded; if they are the only targets, the snapshot falls back to every module. Entry modules are keyed by their source file path, not by their subpath, so moving an entry module itself (changing `"."` from `src/index.ts` to `src/main.ts`) is reported as removing everything it exported. `typesVersions` and `imports` (`#internal`) are not read. Inferred types that the compiler can only print as `import("src/x").Foo` change text when `Foo` moves to another file. In the fallback mode (no usable entry points) every module counts as public, as before, and moving a declaration between files is still reported as a removal.
 - **Git refs.** Refs come from the repository that contains the current directory, and the compared directory is the current directory at each ref (a different subdirectory per side is not supported; use a worktree and `--from <dir>` for that). Dependencies are taken from the current `node_modules` for both refs. Submodule and Git LFS contents are not included.
-- **Textual type comparison.** Types are compared by their printed text, not by assignability. Safe widenings (a parameter accepting more types, a return type getting narrower) are reported as breaking, and `Array<string>` vs `string[]` counts as a change. Renaming a referenced type changes the text of every signature that uses it.
+- **Text comparison outside signatures and properties.** Type aliases, exported variable types, type parameter constraints and defaults, and `extends` clauses are still compared by text, so widening a type alias or a variable type is reported, and `Array<string>` vs `string[]` counts as a change there. Changed types inside signatures and properties also fall back to text when the checker cannot decide (see [Text fallback](#type-compatibility-rules)); in particular, renaming a referenced type (so that the old name no longer exists) is still reported in every signature that uses it.
+- **Compatibility is checked per position.** Each changed parameter or return type is checked on its own, within the overload it belongs to. Type parameter constraints and defaults are still compared by text, so widening a constraint (`T extends string` → `T extends string | number`) is reported.
 - **Parameter matching is positional.** Inserting an optional parameter in the middle is reported as changes to the parameters that follow it.
 - **Not inspected yet:** `this` parameters, `implements` clauses, `declare module 'x'` / `declare global` augmentations, `export =` objects beyond their overall type, JSX (`.tsx`) files, and JavaScript files with JSDoc types.
 - **Baseline matching is exact.** Entries match on `code`, `export`, `member` and optionally `file`; there are no wildcards or patterns, and an accepted change stays accepted even if it changes again in a different way under the same code (for example, a second, different signature change to an accepted function).
@@ -431,11 +474,12 @@ Project layout:
 | `src/git.ts` | Resolves git refs and extracts them into temporary snapshots with `git archive`. |
 | `src/baseline.ts` | Loads and validates baseline files and suppresses accepted changes. |
 | `src/compare.ts` | The breaking-change rules. |
+| `src/compat.ts` | Assignability checks for changed types, with the type checker. |
 | `src/format.ts` | Table and JSON output. |
 | `src/run.ts` / `src/cli.ts` | Argument parsing, exit codes, and the executable entry point. |
 | `src/model.ts` | Types shared by the modules above. |
 | `fixtures/before`, `fixtures/after` | Two versions of a small package used by the tests and the examples above. |
-| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`), `entrypoints.test.ts` (package.json entry points and the fallback). |
+| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback). |
 
 The tests in `cli.test.ts` that run `dist/cli.js` as a separate process are skipped until `npm run build` has been run. CI always builds first.
 

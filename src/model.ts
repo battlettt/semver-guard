@@ -16,10 +16,25 @@ export interface Param {
   rest: boolean;
 }
 
+/**
+ * Where a declaration sits in a snapshot source file. Used to look up its
+ * types with the type checker when two versions are compared.
+ */
+export interface DeclarationRef {
+  /** Absolute file name as seen by the compiler. */
+  file: string;
+  pos: number;
+  end: number;
+  /** `ts.SyntaxKind` of the declaration node. */
+  kind: number;
+}
+
 export interface Signature {
   typeParams: TypeParam[];
   params: Param[];
   returnType: string;
+  /** The declaration this signature comes from, when it has one. */
+  declaration?: DeclarationRef;
 }
 
 export type MemberKind = 'property' | 'method' | 'call' | 'construct' | 'index';
@@ -38,6 +53,8 @@ export interface Member {
   type?: string;
   /** Signatures of a method, call or construct signature. */
   signatures?: Signature[];
+  /** Declaration of a property or index signature (the getter for accessor pairs). */
+  declaration?: DeclarationRef;
 }
 
 export interface FunctionShape {

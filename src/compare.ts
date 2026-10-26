@@ -1,9 +1,11 @@
+import { checkTypeQueries, typeQueryKey, type TypeQuery, type Variance } from './compat.js';
 import type {
   ApiSurface,
   BreakingChange,
   ChangeCode,
   ClassShape,
   CompareResult,
+  DeclarationRef,
   EnumShape,
   ExportEntry,
   InterfaceShape,
@@ -13,6 +15,39 @@ import type {
   Signature,
   TypeParam,
 } from './model.js';
+
+/**
+ * Decides whether a type whose text changed is still compatible. Answers
+ * `false` (report the change) when it cannot tell.
+ */
+type TypesCompatible = (query: TypeQuery) => boolean;
+
+/** How the parameter and return types of a group of signatures may change. */
+interface SignatureRules {
+  params: Variance;
+  returns: Variance;
+}
+
+/** Exported functions, class methods and constructors: callers pass arguments and read results. */
+const CALLABLE: SignatureRules = { params: 'contravariant', returns: 'covariant' };
+/**
+ * Interface methods: consumers also implement them, so a narrower return type
+ * would break implementations. Wider parameters are fine, because TypeScript
+ * checks method parameters bivariantly.
+ */
+const INTERFACE_METHOD: SignatureRules = { params: 'contravariant', returns: 'invariant' };
+/** Interface call and construct signatures: implemented by consumers, and checked strictly. */
+const INTERFACE_SIGNATURE: SignatureRules = { params: 'invariant', returns: 'invariant' };
+
+export interface CompareOptions {
+  /**
+   * How changed types in signatures and properties are compared:
+   * `assignability` (the default) uses the type checker and allows changes
+   * that cannot break consumers, such as a wider parameter type; `text`
+   * reports every change to the printed type, as in version 0.1.
+   */
+  typeComparison?: 'assignability' | 'text';
+}
 
 type Emit = (
   code: ChangeCode,
@@ -29,6 +64,27 @@ export function compareSurfaces(
   before: ApiSurface,
   after: ApiSurface,
   labels: { from: string; to: string } = { from: before.root, to: after.root },
+  options: CompareOptions = {},
+): CompareResult {
+  if (options.typeComparison === 'text') return compareWith(before, after, labels, () => false);
+
+  // First pass: collect every changed type that the checker could clear, with
+  // the text answer ("changed"). Only build a program if there are any.
+  const queries = new Map<string, TypeQuery>();
+  const textResult = compareWith(before, after, labels, (query) => {
+    queries.set(typeQueryKey(query), query);
+    return false;
+  });
+  if (queries.size === 0) return textResult;
+  const answers = checkTypeQueries(after.root, [...queries.values()]);
+  return compareWith(before, after, labels, (query) => answers.get(typeQueryKey(query)) ?? false);
+}
+
+function compareWith(
+  before: ApiSurface,
+  after: ApiSurface,
+  labels: { from: string; to: string },
+  types: TypesCompatible,
 ): CompareResult {
   const changes: BreakingChange[] = [];
   const beforeByKey = new Map(before.exports.map((e) => [entryKey(e), e]));
@@ -75,7 +131,7 @@ export function compareSurfaces(
       reexporters.set(origin, list);
       continue;
     }
-    compareEntry(old, current, emit);
+    compareEntry(old, current, emit, types);
   }
 
   for (const change of changes) {
@@ -122,7 +178,7 @@ function kindLabel(kind: ShapeKind): string {
   return kind === 'type' ? 'type alias' : kind === 'reexport' ? 're-export' : kind;
 }
 
-function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit): void {
+function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit, types: TypesCompatible): void {
   for (const oldShape of old.shapes) {
     const newShape = current.shapes.find((s) => s.kind === oldShape.kind);
     if (!newShape) {
@@ -135,7 +191,12 @@ function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit): void 
     }
     switch (oldShape.kind) {
       case 'function': {
-        const reasons = signatureSetReasons(oldShape.signatures, (newShape as typeof oldShape).signatures);
+        const reasons = signatureSetReasons(
+          oldShape.signatures,
+          (newShape as typeof oldShape).signatures,
+          types,
+          CALLABLE,
+        );
         if (reasons.length > 0) {
           emit('signature-changed', reasons.join('; '), {
             before: oldShape.signatures.map(formatSignature).join(' | '),
@@ -145,10 +206,10 @@ function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit): void 
         break;
       }
       case 'class':
-        compareClass(oldShape, newShape as ClassShape, emit);
+        compareClass(oldShape, newShape as ClassShape, emit, types);
         break;
       case 'interface':
-        compareInterface(oldShape, newShape as InterfaceShape, emit);
+        compareInterface(oldShape, newShape as InterfaceShape, emit, types);
         break;
       case 'type': {
         const next = newShape as typeof oldShape;
@@ -191,7 +252,7 @@ function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit): void 
   }
 }
 
-function compareClass(old: ClassShape, current: ClassShape, emit: Emit): void {
+function compareClass(old: ClassShape, current: ClassShape, emit: Emit, types: TypesCompatible): void {
   if (!old.isAbstract && current.isAbstract) {
     emit('modifier-changed', 'class became abstract and can no longer be instantiated', {
       before: 'class',
@@ -220,6 +281,8 @@ function compareClass(old: ClassShape, current: ClassShape, emit: Emit): void {
     const reasons = signatureSetReasons(
       old.constructors.map(withoutReturnType),
       current.constructors.map(withoutReturnType),
+      types,
+      CALLABLE,
     );
     if (reasons.length > 0) {
       emit('signature-changed', reasons.join('; '), {
@@ -230,10 +293,10 @@ function compareClass(old: ClassShape, current: ClassShape, emit: Emit): void {
     }
   }
 
-  compareMembers(old.members, current.members, 'class', emit);
+  compareMembers(old.members, current.members, 'class', emit, types);
 }
 
-function compareInterface(old: InterfaceShape, current: InterfaceShape, emit: Emit): void {
+function compareInterface(old: InterfaceShape, current: InterfaceShape, emit: Emit, types: TypesCompatible): void {
   compareTypeParamsAndEmit(old.typeParams, current.typeParams, emit);
   for (const base of old.extends) {
     if (!current.extends.includes(base)) {
@@ -243,7 +306,7 @@ function compareInterface(old: InterfaceShape, current: InterfaceShape, emit: Em
       });
     }
   }
-  compareMembers(old.members, current.members, 'interface', emit);
+  compareMembers(old.members, current.members, 'interface', emit, types);
 }
 
 function compareEnum(old: EnumShape, current: EnumShape, emit: Emit): void {
@@ -276,6 +339,7 @@ function compareMembers(
   newMembers: Member[],
   owner: 'class' | 'interface',
   emit: Emit,
+  types: TypesCompatible,
 ): void {
   const byKey = new Map(newMembers.map((m) => [m.key, m]));
   const oldKeys = new Set(oldMembers.map((m) => m.key));
@@ -289,7 +353,7 @@ function compareMembers(
       });
       continue;
     }
-    const reasons = memberReasons(member, next, owner);
+    const reasons = memberReasons(member, next, owner, types);
     if (reasons.length > 0) {
       emit('member-changed', reasons.join('; '), {
         member: member.key,
@@ -324,7 +388,12 @@ function compareMembers(
   }
 }
 
-function memberReasons(old: Member, current: Member, owner: 'class' | 'interface'): string[] {
+function memberReasons(
+  old: Member,
+  current: Member,
+  owner: 'class' | 'interface',
+  types: TypesCompatible,
+): string[] {
   if (old.kind !== current.kind) return [`changed from ${old.kind} to ${current.kind}`];
   const reasons: string[] = [];
   if (old.visibility === 'public' && current.visibility === 'protected') {
@@ -334,11 +403,21 @@ function memberReasons(old: Member, current: Member, owner: 'class' | 'interface
   if (owner === 'interface' && old.optional && !current.optional) reasons.push('became required');
   if (!old.readonly && current.readonly) reasons.push('became readonly');
   if (owner === 'class' && !old.isAbstract && current.isAbstract) reasons.push('became abstract');
-  if (old.type !== undefined && old.type !== current.type) {
+  // Consumers of a class only read a readonly property, so it may narrow.
+  // Writable properties and interface properties (which consumers also
+  // supply, in object literals and implementations) must keep an equivalent type.
+  const propertyVariance: Variance = owner === 'class' && old.readonly ? 'covariant' : 'invariant';
+  if (
+    old.type !== undefined &&
+    current.type !== undefined &&
+    !compatible(types, old.type, current.type, current.declaration, 'type', propertyVariance)
+  ) {
     reasons.push(`type changed from ${old.type} to ${current.type}`);
   }
   if (old.signatures && current.signatures) {
-    reasons.push(...signatureSetReasons(old.signatures, current.signatures));
+    const rules =
+      owner === 'class' ? CALLABLE : current.kind === 'method' ? INTERFACE_METHOD : INTERFACE_SIGNATURE;
+    reasons.push(...signatureSetReasons(old.signatures, current.signatures, types, rules));
   }
   return reasons;
 }
@@ -347,7 +426,12 @@ function memberReasons(old: Member, current: Member, owner: 'class' | 'interface
  * Every old signature (overload) must still be satisfied by at least one new
  * signature. Returns the reasons for the first overload that is not.
  */
-function signatureSetReasons(oldSigs: Signature[], newSigs: Signature[]): string[] {
+function signatureSetReasons(
+  oldSigs: Signature[],
+  newSigs: Signature[],
+  types: TypesCompatible,
+  rules: SignatureRules,
+): string[] {
   const reasons: string[] = [];
   for (const old of oldSigs) {
     if (newSigs.length === 0) {
@@ -356,7 +440,7 @@ function signatureSetReasons(oldSigs: Signature[], newSigs: Signature[]): string
     }
     let best: string[] | undefined;
     for (const candidate of newSigs) {
-      const r = signatureReasons(old, candidate);
+      const r = signatureReasons(old, candidate, types, rules);
       if (best === undefined || r.length < best.length) best = r;
       if (r.length === 0) break;
     }
@@ -371,7 +455,12 @@ function signatureSetReasons(oldSigs: Signature[], newSigs: Signature[]): string
   return reasons;
 }
 
-function signatureReasons(old: Signature, current: Signature): string[] {
+function signatureReasons(
+  old: Signature,
+  current: Signature,
+  types: TypesCompatible,
+  rules: SignatureRules,
+): string[] {
   const reasons = typeParamReasons(old.typeParams, current.typeParams);
 
   old.params.forEach((param, i) => {
@@ -381,7 +470,7 @@ function signatureReasons(old: Signature, current: Signature): string[] {
       return;
     }
     if (param.name !== next.name) reasons.push(`parameter ${param.name} was renamed to ${next.name}`);
-    if (param.type !== next.type) {
+    if (!compatible(types, param.type, next.type, current.declaration, i, rules.params)) {
       reasons.push(`type of parameter ${next.name} changed from ${param.type} to ${next.type}`);
     }
     if (param.optional && !next.optional && !next.rest) {
@@ -399,10 +488,24 @@ function signatureReasons(old: Signature, current: Signature): string[] {
     if (!added.optional && !added.rest) reasons.push(`required parameter ${added.name} was added`);
   }
 
-  if (old.returnType !== current.returnType) {
+  if (!compatible(types, old.returnType, current.returnType, current.declaration, 'return', rules.returns)) {
     reasons.push(`return type changed from ${old.returnType} to ${current.returnType}`);
   }
   return reasons;
+}
+
+/** Equal texts are compatible; otherwise ask the checker, if the new declaration is known. */
+function compatible(
+  types: TypesCompatible,
+  before: string,
+  after: string,
+  declaration: DeclarationRef | undefined,
+  position: TypeQuery['position'],
+  variance: Variance,
+): boolean {
+  if (before === after) return true;
+  if (!declaration) return false;
+  return types({ before, after, declaration, position, variance });
 }
 
 function typeParamReasons(old: TypeParam[], current: TypeParam[]): string[] {
