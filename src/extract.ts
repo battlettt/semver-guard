@@ -9,6 +9,7 @@ import type {
   EnumMember,
   EnumShape,
   ExportEntry,
+  FunctionShape,
   InterfaceShape,
   Member,
   Param,
@@ -38,6 +39,23 @@ export const COMPILER_OPTIONS: ts.CompilerOptions = {
   jsx: ts.JsxEmit.ReactJSX,
   types: [],
 };
+
+/**
+ * Annotations that make a variable a function component (`React.FC<Props>`,
+ * `FunctionComponent<Props>`). Recognized by name, qualified or not, so React's
+ * types do not have to be installed in the snapshot.
+ */
+const COMPONENT_TYPES = new Set(['FC', 'FunctionComponent']);
+/** Calls (`memo(...)`, `React.forwardRef(...)`) whose argument is the component. Also recognized by name. */
+const COMPONENT_WRAPPERS = new Set(['memo', 'forwardRef']);
+/** How deep `memo(forwardRef(Inner))` chains and references to other components are followed. */
+const MAX_COMPONENT_DEPTH = 8;
+
+/** Props (and forwarded ref) of a component, and how it is written. */
+interface ComponentInfo {
+  form: string;
+  params: Param[];
+}
 
 const TYPE_FORMAT =
   ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope;
@@ -356,6 +374,10 @@ class Extractor {
   }
 
   private variableShape(decl: ts.VariableDeclaration, symbol: ts.Symbol): Shape {
+    const component = decl.type
+      ? this.annotatedComponent(decl.type, decl.initializer)
+      : decl.initializer && this.wrappedComponent(decl.initializer, 0);
+    if (component) return this.componentShape(component, decl);
     if (!decl.type && decl.initializer && isFunctionExpressionLike(decl.initializer)) {
       return { kind: 'function', signatures: this.callSignatures(symbol, decl) };
     }
@@ -368,6 +390,9 @@ class Extractor {
   }
 
   private expressionShape(expression: ts.Expression): Shape {
+    // `export default memo(Button)`: the export assignment is the anchor for type checks.
+    const component = this.wrappedComponent(expression, 0);
+    if (component && ts.isExportAssignment(expression.parent)) return this.componentShape(component, expression.parent);
     const type = this.checker.getTypeAtLocation(expression);
     if (isFunctionExpressionLike(expression)) {
       return {
@@ -376,6 +401,139 @@ class Extractor {
       };
     }
     return { kind: 'variable', type: this.typeString(type, expression) };
+  }
+
+  /**
+   * A component compared by its props: one signature whose declaration is the
+   * variable (or `export default`) holding it. The type checker compares props
+   * types next to that statement (see `checkTypeQueries`).
+   */
+  private componentShape(component: ComponentInfo, anchor: ts.VariableDeclaration | ts.ExportAssignment): FunctionShape {
+    return {
+      kind: 'function',
+      component: component.form,
+      signatures: [{ typeParams: [], params: component.params, returnType: '', declaration: declarationRef(anchor) }],
+    };
+  }
+
+  /** `const X: React.FC<Props> = (props) => ...`: the props come from the annotation. */
+  private annotatedComponent(type: ts.TypeNode, initializer: ts.Expression | undefined): ComponentInfo | undefined {
+    if (!ts.isTypeReferenceNode(type)) return undefined;
+    const name = ts.isIdentifier(type.typeName) ? type.typeName.text : type.typeName.right.text;
+    if (!COMPONENT_TYPES.has(name) || (type.typeArguments?.length ?? 0) > 1) return undefined;
+    const fn = initializer && functionExpression(initializer);
+    return {
+      form: this.nodeText(type.typeName),
+      params: [this.propsParam(type.typeArguments?.[0], fn?.parameters[0])],
+    };
+  }
+
+  /** `memo(Inner)`, `forwardRef<Ref, Props>((props, ref) => ...)`, `React.memo(forwardRef(...))`. */
+  private wrappedComponent(expression: ts.Expression, depth: number): ComponentInfo | undefined {
+    const call = skipParentheses(expression);
+    if (depth > MAX_COMPONENT_DEPTH || !ts.isCallExpression(call) || call.arguments.length === 0) return undefined;
+    const callee = skipParentheses(call.expression);
+    const name = ts.isIdentifier(callee)
+      ? callee.text
+      : ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : undefined;
+    if (name === undefined || !COMPONENT_WRAPPERS.has(name)) return undefined;
+    const inner = skipParentheses(call.arguments[0]);
+    const [first, second] = call.typeArguments ?? [];
+
+    if (name === 'forwardRef') {
+      // forwardRef<RefTarget, Props>(render): render receives (props, ref).
+      const render = this.localFunction(inner, depth + 1);
+      if (!render && !second) return undefined;
+      return {
+        form: 'forwardRef',
+        params: [this.propsParam(second, render?.parameters[0]), this.refParam(first, render?.parameters[1])],
+      };
+    }
+
+    // memo<Props>(Inner): Inner is a function, another wrapper, or a reference to a component.
+    const wrapped = this.innerComponent(inner, depth + 1);
+    if (!wrapped && !first) return undefined;
+    const params = wrapped ? [...wrapped.params] : [this.propsParam(first, undefined)];
+    if (wrapped && first) params[0] = { ...this.propsParam(first, undefined), name: params[0]?.name ?? 'props' };
+    return { form: wrapped && wrapped.form !== 'function' ? `memo(${wrapped.form})` : 'memo', params };
+  }
+
+  /** The component passed to `memo`: an inline function, a wrapper call, or a reference to a local component. */
+  private innerComponent(expression: ts.Expression, depth: number): ComponentInfo | undefined {
+    if (depth > MAX_COMPONENT_DEPTH) return undefined;
+    const fn = functionExpression(expression);
+    if (fn) return { form: 'function', params: [this.propsParam(undefined, fn.parameters[0])] };
+    if (ts.isCallExpression(expression)) return this.wrappedComponent(expression, depth);
+    const decl = this.localDeclaration(expression);
+    if (!decl) return undefined;
+    if (ts.isFunctionDeclaration(decl)) return { form: 'function', params: [this.propsParam(undefined, decl.parameters[0])] };
+    if (decl.type) return this.annotatedComponent(decl.type, decl.initializer);
+    return decl.initializer ? this.innerComponent(skipParentheses(decl.initializer), depth + 1) : undefined;
+  }
+
+  /** The render function given to `forwardRef`: inline, or a local function or function-valued constant. */
+  private localFunction(expression: ts.Expression, depth: number): ts.SignatureDeclaration | undefined {
+    const fn = functionExpression(expression);
+    if (fn) return fn;
+    const decl = depth <= MAX_COMPONENT_DEPTH ? this.localDeclaration(expression) : undefined;
+    if (!decl) return undefined;
+    if (ts.isFunctionDeclaration(decl)) return decl;
+    return decl.initializer && !decl.type ? this.localFunction(skipParentheses(decl.initializer), depth + 1) : undefined;
+  }
+
+  /** The function or variable declared in the snapshot that an identifier refers to (following imports). */
+  private localDeclaration(expression: ts.Expression): ts.FunctionDeclaration | ts.VariableDeclaration | undefined {
+    if (!ts.isIdentifier(expression)) return undefined;
+    let symbol = this.checker.getSymbolAtLocation(expression);
+    if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
+    const decl = symbol?.declarations?.find(
+      (d): d is ts.FunctionDeclaration | ts.VariableDeclaration =>
+        ts.isFunctionDeclaration(d) || ts.isVariableDeclaration(d),
+    );
+    return decl && decl.getSourceFile().fileName.startsWith(this.rootPrefix) ? decl : undefined;
+  }
+
+  /**
+   * The props parameter of a component: typed by `typeNode` (a type argument
+   * of `FC`, `memo` or `forwardRef`) if given, otherwise by the function's own
+   * first parameter. `{}` if neither says anything.
+   */
+  private propsParam(typeNode: ts.TypeNode | undefined, decl: ts.ParameterDeclaration | undefined): Param {
+    const node = typeNode ?? decl?.type;
+    const param: Param = {
+      name: decl ? this.nodeText(decl.name) : 'props',
+      type: node ? this.nodeText(node) : decl ? this.declarationType(decl) : '{}',
+      optional: false,
+      rest: false,
+    };
+    const structure = node && this.localStructure(node);
+    if (structure !== undefined) param.structure = structure;
+    return param;
+  }
+
+  /**
+   * The ref a `forwardRef` component accepts, written as its target type
+   * (`HTMLButtonElement` for `forwardRef<HTMLButtonElement, P>` or a render
+   * function whose second parameter is `Ref<HTMLButtonElement>`). Optional,
+   * since consumers need not pass a ref.
+   */
+  private refParam(typeNode: ts.TypeNode | undefined, decl: ts.ParameterDeclaration | undefined): Param {
+    let node = typeNode;
+    if (!node && decl?.type) {
+      const annotation = decl.type;
+      node =
+        ts.isTypeReferenceNode(annotation) && annotation.typeArguments?.length === 1
+          ? annotation.typeArguments[0]
+          : annotation;
+    }
+    return {
+      name: 'ref',
+      type: node ? this.nodeText(node) : decl ? this.declarationType(decl) : 'unknown',
+      optional: true,
+      rest: false,
+    };
   }
 
   private callSignatures(symbol: ts.Symbol, location: ts.Node): Signature[] {
@@ -757,6 +915,20 @@ function describeAlias(symbol: ts.Symbol): string {
       ? ` from "${node.moduleSpecifier.text}"`
       : '';
   return `${normalizeWhitespace(decl.getText())}${specifier}`;
+}
+
+function skipParentheses(node: ts.Expression): ts.Expression {
+  let expr = node;
+  // `as` is not skipped: it changes the type consumers see.
+  while (ts.isParenthesizedExpression(expr) || ts.isSatisfiesExpression(expr)) {
+    expr = expr.expression;
+  }
+  return expr;
+}
+
+function functionExpression(node: ts.Expression): ts.ArrowFunction | ts.FunctionExpression | undefined {
+  const expr = skipParentheses(node);
+  return ts.isArrowFunction(expr) || ts.isFunctionExpression(expr) ? expr : undefined;
 }
 
 function isFunctionExpressionLike(node: ts.Expression): boolean {

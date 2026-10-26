@@ -4,6 +4,26 @@ All notable changes to semver-guard are listed here. The project follows [Semant
 
 Versions 1 and 2 were both published under the package version `0.1.0`. Version 3 is the first release under `0.2.0`.
 
+## v5 (0.4.0): wildcard baselines and wrapped components
+
+### Added
+
+- Baseline entries may use `*` in `export` and `member`. `*` matches any run of characters (including none and including `.`); every other character is literal. Each field is matched separately, so a pattern never crosses the export/member boundary, and an entry without `member` still only matches changes without one. For example, `{ "code": "member-removed", "export": "Button", "member": "on*" }` accepts every removed `on*` member of `Button`, and `{ "code": "export-removed", "export": "*" }` accepts every removed export.
+- Components typed as `React.FC<Props>`, `FC<Props>`, `FunctionComponent<Props>` or `React.FunctionComponent<Props>` are compared by their props with the parameter rule (widening allowed, narrowing reported), instead of by the text of the annotation.
+- `memo(...)` and `forwardRef(...)` calls (also `React.memo`/`React.forwardRef`, nested `memo(forwardRef(...))`, references to a local component, and `export default memo(X)`) are unwrapped to find the inner component, whose props are compared the same way. Type arguments (`memo<Props>`, `forwardRef<Ref, Props>`) take precedence over the inner function's parameter. A `forwardRef` component's ref target is compared by text, and removing `forwardRef` is reported as `parameter ref was removed`.
+- These forms are recognized by name; React's types do not have to be installed in the snapshot.
+- `matchesPattern` is exported from the library entry point alongside the other baseline helpers.
+
+### Changed
+
+- For `FC`-typed and wrapped components, the return type and the name of the props parameter are not compared. Switching between these forms and a plain function component is not reported when the props stay compatible.
+- `before`/`after` for these components show the form and the props, e.g. `memo (props: ListProps)`.
+- A baseline `file` containing `*`, and an `export` or `member` containing `**`, are now errors (exit code `2`). Before, they were exact strings that could never match.
+
+### Project
+
+- `test/components.test.ts` and new wildcard tests in `test/baseline.test.ts` (175 tests).
+
 ## v4 (0.3.0): .tsx support and type alias identity
 
 ### Added

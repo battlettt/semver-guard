@@ -8,6 +8,7 @@ import type {
   DeclarationRef,
   EnumShape,
   ExportEntry,
+  FunctionShape,
   InterfaceShape,
   Member,
   Shape,
@@ -25,7 +26,10 @@ type TypesCompatible = (query: TypeQuery) => boolean;
 /** How the parameter and return types of a group of signatures may change. */
 interface SignatureRules {
   params: Variance;
-  returns: Variance;
+  /** Undefined: return types are not compared. */
+  returns?: Variance;
+  /** Parameter names are irrelevant to callers (component props are passed as JSX attributes). */
+  ignoreParamNames?: boolean;
 }
 
 /** Exported functions, class methods and constructors: callers pass arguments and read results. */
@@ -38,6 +42,12 @@ const CALLABLE: SignatureRules = { params: 'contravariant', returns: 'covariant'
 const INTERFACE_METHOD: SignatureRules = { params: 'contravariant', returns: 'invariant' };
 /** Interface call and construct signatures: implemented by consumers, and checked strictly. */
 const INTERFACE_SIGNATURE: SignatureRules = { params: 'invariant', returns: 'invariant' };
+/**
+ * Components typed as `FC<Props>` or wrapped in `memo`/`forwardRef`: consumers
+ * render them with JSX, so only the props (and the forwarded ref) matter. What
+ * the component renders is not part of its API.
+ */
+const COMPONENT: SignatureRules = { params: 'contravariant', ignoreParamNames: true };
 
 export interface CompareOptions {
   /**
@@ -191,16 +201,18 @@ function compareEntry(old: ExportEntry, current: ExportEntry, emit: Emit, types:
     }
     switch (oldShape.kind) {
       case 'function': {
+        const next = newShape as typeof oldShape;
+        const isComponent = oldShape.component !== undefined || next.component !== undefined;
         const reasons = signatureSetReasons(
           oldShape.signatures,
-          (newShape as typeof oldShape).signatures,
+          next.signatures,
           types,
-          CALLABLE,
+          isComponent ? COMPONENT : CALLABLE,
         );
         if (reasons.length > 0) {
           emit('signature-changed', reasons.join('; '), {
-            before: oldShape.signatures.map(formatSignature).join(' | '),
-            after: (newShape as typeof oldShape).signatures.map(formatSignature).join(' | '),
+            before: formatFunction(oldShape),
+            after: formatFunction(next),
           });
         }
         break;
@@ -472,7 +484,7 @@ function signatureReasons(
       reasons.push(`${param.rest ? 'rest parameter' : 'parameter'} ${param.name} was removed`);
       return;
     }
-    if (param.name !== next.name) reasons.push(`parameter ${param.name} was renamed to ${next.name}`);
+    if (!rules.ignoreParamNames && param.name !== next.name) reasons.push(`parameter ${param.name} was renamed to ${next.name}`);
     if (!compatible(types, param.type, next.type, current.declaration, i, rules.params)) {
       reasons.push(`type of parameter ${next.name} changed from ${param.type} to ${next.type}`);
     } else if (
@@ -501,7 +513,10 @@ function signatureReasons(
     if (!added.optional && !added.rest) reasons.push(`required parameter ${added.name} was added`);
   }
 
-  if (!compatible(types, old.returnType, current.returnType, current.declaration, 'return', rules.returns)) {
+  if (
+    rules.returns !== undefined &&
+    !compatible(types, old.returnType, current.returnType, current.declaration, 'return', rules.returns)
+  ) {
     reasons.push(`return type changed from ${old.returnType} to ${current.returnType}`);
   }
   return reasons;
@@ -593,6 +608,12 @@ function formatParams(signature: Signature): string {
 
 export function formatSignature(signature: Signature): string {
   return `${formatTypeParams(signature.typeParams)}${formatParams(signature)}: ${signature.returnType}`;
+}
+
+/** `(a: string): void`, or `memo (props: Props)` for a wrapped or `FC`-typed component. */
+function formatFunction(shape: FunctionShape): string {
+  if (shape.component === undefined) return shape.signatures.map(formatSignature).join(' | ');
+  return shape.signatures.map((s) => `${shape.component} ${formatParams(s)}`).join(' | ');
 }
 
 function formatConstructor(signature: Signature): string {

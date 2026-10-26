@@ -224,10 +224,36 @@ Each entry identifies a change with the same fields as the [JSON output](#exampl
 | Field | Required | Matching |
 | --- | --- | --- |
 | `code` | yes | Must equal the change's `code`, and must be one of the codes listed under [Breaking-change rules](#breaking-change-rules). |
-| `export` | yes | Must equal the change's `export` (dotted for namespace members, `default` for default exports). |
-| `member` | no | Must equal the change's `member`. An entry **without** `member` only matches changes that have no member, so accepting `Client#disconnect` does not accept other changes to `Client`. |
-| `file` | no | Must equal the change's `file`. Omit it to match the change in any file (the example above accepts `legacyHelper` being removed from both `src/legacy.ts` and `src/index.ts`). |
+| `export` | yes | Must match the change's `export` (dotted for namespace members, `default` for default exports). May contain `*`, see [Wildcards](#wildcards). |
+| `member` | no | Must match the change's `member`. May contain `*`. An entry **without** `member` only matches changes that have no member, so accepting `Client#disconnect` does not accept other changes to `Client`. |
+| `file` | no | Must equal the change's `file` exactly (no wildcards). Omit it to match the change in any file (the example above accepts `legacyHelper` being removed from both `src/legacy.ts` and `src/index.ts`). |
 | `reason` | no | Free-form note for reviewers. Ignored by the tool. |
+
+#### Wildcards
+
+`export` and `member` may contain `*` to accept a group of changes with one entry:
+
+```json
+{
+  "accepted": [
+    { "code": "member-removed", "export": "Button", "member": "on*", "reason": "event props moved to a single onEvent prop" },
+    { "code": "export-removed", "export": "*", "reason": "2.0 drops the deprecated helpers" },
+    { "code": "export-removed", "export": "Utils.*" }
+  ]
+}
+```
+
+The rules are exact:
+
+- `*` matches any run of characters, including none. `on*` matches `on`, `onClick` and `onHover`; `*` matches everything.
+- `*` matches every character, including `.`, so `Utils.*` matches every namespace member of `Utils` (`Utils.format`, `Utils.a.b`).
+- `*` is the only wildcard. Every other character matches only itself: `?`, `[`, `]`, `{`, `}` and `\` have no special meaning (member keys such as `[string]` for an index signature or `()` for a call signature are written as they appear in the report).
+- Each field is matched on its own; a pattern never crosses the export/member boundary. `export: "Button*"` matches the exports `Button` and `ButtonGroup`, not the members of `Button`. The rule about `member` still holds with wildcards: an entry without `member` matches only changes that have no member (so `export: "*"` alone accepts removed exports and other export-level changes of the given `code`, but no member changes), and `member: "*"` matches every change that has a member, but none without one.
+- `code` is never a pattern (it must still be one of the known codes), and neither is `file`: a `*` in `file` is an error.
+- `**` is an error (a single `*` already matches any run of characters, including `/` and `.`).
+- Unknown fields are still rejected, so a misspelled `memebr` cannot silently widen an entry to the whole export.
+
+Invalid patterns make the baseline file invalid: the tool exits with `2` before comparing anything. A wildcard entry that matches no change gets the same "did not match any reported change" warning as an exact entry.
 
 The other fields of a JSON report entry (`exportKind`, `message`, `before`, `after`, `reexportedBy`) are allowed and ignored, so you can paste entries from a report. A whole saved report also works as a baseline (its `changes` are all accepted), which is the quickest way to accept everything currently reported:
 
@@ -356,7 +382,7 @@ Every signature (overload) of the old version must still exist in the new versio
 | Change | Breaking? |
 | --- | --- |
 | Parameter removed | **yes** |
-| Parameter renamed | **yes** (names show up in editor hints and docs and are often relied on, so this rule is deliberately strict) |
+| Parameter renamed | **yes** (names show up in editor hints and docs and are often relied on, so this rule is deliberately strict). Not reported for the props of `FC`-typed and `memo`/`forwardRef`-wrapped components, see [React components](#react-components-tsx). |
 | Parameter type changed so that it no longer accepts everything it accepted before (narrowed or unrelated) | **yes** |
 | Parameter type widened (e.g. `string` → `string \| number`, or a member added to a union) | no, see [compatibility rules](#type-compatibility-rules) |
 | Optional or defaulted parameter became required | **yes** |
@@ -412,6 +438,34 @@ Props types are compared where they are written:
 - **Inline** (`props: { label: string }`): compared as the parameter type.
 - **Not exported** (`type Props = ...` or `interface Props` in the same module): compared by members, see [Non-exported parameter types](#type-compatibility-rules).
 - **Exported** (`export interface ButtonProps`): reported on the props type itself, by the [interface](#interfaces) or [type alias](#type-aliases) rules, which are stricter than the parameter rule because consumers also read and implement exported types. For example, a new optional prop is fine, but widening a union-typed prop of an exported interface is reported.
+
+#### `React.FC`, `memo` and `forwardRef`
+
+Components that are not plain functions are compared by their props too, with the same parameter rule (widening allowed, narrowing reported):
+
+| Form | Props come from |
+| --- | --- |
+| `export const Button: React.FC<ButtonProps> = (props) => ...` (also `FC<P>`, `FunctionComponent<P>`, `React.FunctionComponent<P>`) | The type argument `ButtonProps`. `FC` with no type argument has props `{}`. |
+| `export const List = memo(function List(props: ListProps) { ... })` (also `React.memo`, arrow functions) | The inner function's first parameter. |
+| `export const Box = memo(Inner)` / `export default memo(Inner)` | `Inner`, followed to its declaration in the snapshot: a function, an `FC`-typed constant, or another `memo`/`forwardRef` call. |
+| `memo<ChipProps>(Chip)` | The type argument, which takes precedence over the inner function. |
+| `export const Input = forwardRef<HTMLInputElement, InputProps>((props, ref) => ...)` (also `React.forwardRef`) | The second type argument; without type arguments, the render function's first parameter. |
+
+A `forwardRef` component also has a `ref`, compared like an extra optional parameter: its target type (`HTMLInputElement`, taken from the first type argument or from a render parameter typed `Ref<T>`/`ForwardedRef<T>`) is compared **by text**, and a component that stops forwarding its ref (`forwardRef(...)` replaced by a plain function) is reported as `parameter ref was removed`. Starting to forward a ref is not reported.
+
+```tsx
+// 1.0.0
+export const Badge: React.FC<{ label: string }> = ({ label }) => <span>{label}</span>;
+export const Input = forwardRef<HTMLInputElement, { size: 'sm' | 'lg' }>((props, ref) => <input ref={ref} />);
+
+// 1.1.0
+export const Badge: React.FC<{ label: string | number }> = ({ label }) => <span>{label}</span>; // widened: not reported
+export const Input = forwardRef<HTMLInputElement, { size: 'sm' }>((props, ref) => <input ref={ref} />);  // narrowed: reported
+```
+
+For these components, the report's `exportKind` is `function`, and `before`/`after` show the form and the props, e.g. `forwardRef (props: { size: 'sm' | 'lg'; }, ref?: HTMLInputElement)`. What they render (the return type) is not compared, and neither is the name of the props parameter, so switching between these forms and plain function components (`React.FC` -> `function Badge({ label }: Props)`, adding `memo`) is not reported as long as the props are compatible.
+
+**Recognized by name, React not required.** `FC`, `FunctionComponent`, `memo` and `forwardRef` are recognized by their names (unqualified, or as the last part of a qualified name such as `React.FC`), not by resolving them to React's declarations. This keeps the comparison working in snapshots without React's types in `node_modules`, which is common for git-ref snapshots and minimal fixtures, and keeps the result the same whether or not they are installed. The flip side is that a function of your own called `memo` or `forwardRef`, or a type called `FC`, whose first argument or type argument is a component, is treated the same way. The props types themselves are still compared with the type checker: types that need React to resolve (for example a prop typed `React.ReactNode` without React installed) fall back to the text comparison.
 
 JSX is type-checked with the automatic runtime (`jsx: react-jsx`, importing `react/jsx-runtime`). If the snapshot has React's types in `node_modules`, component return types are `JSX.Element` (or whatever the runtime declares); without them, JSX expressions are typed as `any` and return types print as `any` on both sides, which does not affect the props comparison.
 
@@ -531,11 +585,11 @@ Targets that cannot be mapped are skipped as long as at least one target resolve
 - **Text comparison outside signatures, properties and aliases.** Exported variable types, type parameter constraints and defaults, `extends` clauses and generic type alias targets are still compared by text, so widening a variable type is reported, and `Array<string>` vs `string[]` counts as a change there. Changed types inside signatures, properties and aliases also fall back to text when the checker cannot decide (see [Text fallback](#type-compatibility-rules)); in particular, renaming a referenced type (so that the old name no longer exists) is still reported in every signature that uses it.
 - **Alias identity is strict.** Mutually assignable but not identical targets are reported, including an intersection replaced by the equivalent single object type (see [Type aliases](#type-aliases)).
 - **Non-exported types are only expanded one level, and only as parameter types.** A non-exported `Props` type used directly as a parameter is compared by its members; a non-exported type used as a return type, a property type, or nested inside another type (`props: Props[]`, `Partial<Props>`, a member of `Props` whose type is another non-exported type) is still compared by name, so changes to its members are not seen. Renaming a non-exported parameter type is reported (the old name no longer resolves), even if its members are unchanged. Props declared in another module and imported count as exported from that module and are compared there (in the fallback mode) or not at all (with entry points, if the entry point does not export them).
-- **Component typing styles.** Components typed through their variable (`export const Button: React.FC<ButtonProps> = ...`) are exported variables, compared by the text of the annotation, so their props are not compared by the parameter rule; use a function or an arrow function with an annotated parameter. Class components are compared as classes. `defaultProps`, `forwardRef`/`memo` wrappers (`export const Button = memo(...)`) and the element types a component renders are not inspected beyond the exported value's type.
+- **Component typing styles.** `FC`/`FunctionComponent` annotations and `memo`/`forwardRef` wrappers are recognized by name (see [React components](#react-components-tsx)); other annotations (`ComponentType<P>`, `VFC<P>`, `ExoticComponent<P>`) and other wrappers (`lazy`, `styled(...)`, higher-order components of your own) are compared as exported variables, by text. A `forwardRef` ref target is compared by text, and a wrapped component whose props type is declared in another module and is not in scope where the component is exported falls back to the text comparison. Wrapping or unwrapping a component in `memo`, or switching between `FC` and a plain function, is not reported, although code that calls the component as a plain function (not through JSX) breaks when `memo` or `forwardRef` is added. A `const` whose initializer is cast (`memo(Inner) as typeof Inner`) is compared by the cast type. Class components are compared as classes. `defaultProps`, `propTypes` and the element types a component renders are not inspected.
 - **Compatibility is checked per position.** Each changed parameter or return type is checked on its own, within the overload it belongs to. Type parameter constraints and defaults are still compared by text, so widening a constraint (`T extends string` → `T extends string | number`) is reported.
 - **Parameter matching is positional.** Inserting an optional parameter in the middle is reported as changes to the parameters that follow it.
 - **Not inspected yet:** `this` parameters, `implements` clauses, `declare module 'x'` / `declare global` augmentations, `export =` objects beyond their overall type, and JavaScript (`.js`/`.jsx`) files with JSDoc types.
-- **Baseline matching is exact.** Entries match on `code`, `export`, `member` and optionally `file`; there are no wildcards or patterns, and an accepted change stays accepted even if it changes again in a different way under the same code (for example, a second, different signature change to an accepted function).
+- **Baseline matching.** Entries match on `code`, `export`, `member` and optionally `file`. Only `export` and `member` accept `*` wildcards; `file` and `code` are exact, and there are no character classes, alternatives or negations. An accepted change stays accepted even if it changes again in a different way under the same code (for example, a second, different signature change to an accepted function), and a wildcard entry also accepts future changes that happen to match it.
 
 ## Development
 
@@ -560,7 +614,7 @@ Project layout:
 | `src/model.ts` | Types shared by the modules above. |
 | `fixtures/before`, `fixtures/after` | Two versions of a small package used by the tests and the examples above. |
 | `fixtures/components-before`, `fixtures/components-after` | Two versions of a small `.tsx` component package (widened props, narrowed props, a removed component, internal changes). |
-| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback), `tsx.test.ts` (`.tsx` files, component props and the component fixtures), `alias.test.ts` (type alias identity and its fallback). |
+| `test/` | `fixtures.test.ts` (fixture packages), `rules.test.ts` (one test group per rule, using temporary snapshots), `cli.test.ts` (arguments, exit codes, output formats, and the built executable), `git.test.ts` (ref inputs against temporary git repositories; skipped if `git` is not installed), `baseline.test.ts` (`--baseline`, including wildcard entries), `entrypoints.test.ts` (package.json entry points and the fallback), `compat.test.ts` (type compatibility rules, compared with the text comparison, and the text fallback), `tsx.test.ts` (`.tsx` files, component props and the component fixtures), `components.test.ts` (`React.FC`-typed, `memo` and `forwardRef` components), `alias.test.ts` (type alias identity and its fallback). |
 
 The tests in `cli.test.ts` that run `dist/cli.js` as a separate process are skipped until `npm run build` has been run. CI always builds first.
 

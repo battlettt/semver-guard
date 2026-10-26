@@ -7,10 +7,11 @@ export class BaselineError extends Error {}
 /** A breaking change the maintainer has accepted, identified the same way as in the JSON report. */
 export interface BaselineEntry {
   code: ChangeCode;
+  /** Exported name, or a pattern where `*` matches any run of characters (see `matchesPattern`). */
   export: string;
-  /** Omitted: matches the change in any file. */
+  /** Omitted: matches the change in any file. Matched exactly (no wildcards). */
   file?: string;
-  /** Omitted: matches only changes that have no member. */
+  /** Omitted: matches only changes that have no member. May contain `*` like `export`. */
   member?: string;
   /** Free-form note explaining why the change is accepted. */
   reason?: string;
@@ -98,6 +99,13 @@ export function parseBaseline(data: unknown, file = 'baseline'): BaselineEntry[]
     for (const key of ['file', 'member', 'reason'] as const) {
       if (raw[key] !== undefined && typeof raw[key] !== 'string') fail(`${where}.${key} must be a string`);
     }
+    for (const key of ['export', 'member'] as const) {
+      const problem = typeof raw[key] === 'string' ? patternProblem(raw[key] as string) : undefined;
+      if (problem) fail(`${where}.${key} "${raw[key]}" is not a valid pattern: ${problem}`);
+    }
+    if (typeof raw.file === 'string' && raw.file.includes('*')) {
+      fail(`${where}.file "${raw.file}" contains "*", but wildcards are only supported in "export" and "member"`);
+    }
     const entry: BaselineEntry = { code: raw.code as ChangeCode, export: raw.export as string };
     if (raw.file !== undefined) entry.file = raw.file as string;
     if (raw.member !== undefined) entry.member = raw.member as string;
@@ -109,10 +117,40 @@ export function parseBaseline(data: unknown, file = 'baseline'): BaselineEntry[]
 export function matchesBaseline(entry: BaselineEntry, change: BreakingChange): boolean {
   return (
     entry.code === change.code &&
-    entry.export === change.export &&
-    entry.member === change.member &&
+    matchesPattern(entry.export, change.export) &&
+    (entry.member === undefined
+      ? change.member === undefined
+      : change.member !== undefined && matchesPattern(entry.member, change.member)) &&
     (entry.file === undefined || entry.file === change.file)
   );
+}
+
+/** Why `pattern` cannot be used in an `export` or `member` field, or undefined if it can. */
+function patternProblem(pattern: string): string | undefined {
+  if (pattern.includes('**')) return '"**" is not supported (a single "*" already matches any run of characters)';
+  return undefined;
+}
+
+const patternCache = new Map<string, RegExp>();
+
+/**
+ * Matches one `export` or `member` value against a baseline pattern. `*`
+ * matches any run of characters, including none and including `.` (so
+ * `Utils.*` matches every namespace member of `Utils`); every other character
+ * matches itself. Without `*` this is an exact comparison.
+ */
+export function matchesPattern(pattern: string, value: string): boolean {
+  if (!pattern.includes('*')) return pattern === value;
+  let regex = patternCache.get(pattern);
+  if (!regex) {
+    const source = pattern
+      .split('*')
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('.*');
+    regex = new RegExp(`^${source}$`, 's');
+    patternCache.set(pattern, regex);
+  }
+  return regex.test(value);
 }
 
 /** Removes accepted changes from `result` and reports which entries matched nothing. */

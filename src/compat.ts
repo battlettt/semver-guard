@@ -41,6 +41,8 @@ const PROBE = '__semverGuardOld';
 const PROBE_NAME = new RegExp(`^${PROBE}(\\d+)$`);
 /** Name of the identity test inserted next to a type alias probe. */
 const IDENTITY_PROBE = '__semverGuardSame';
+/** Name of the alias holding the new type, inserted after the old one for component props. */
+const NEW_PROBE = '__semverGuardNew';
 
 interface Probe {
   id: number;
@@ -48,6 +50,8 @@ interface Probe {
   query: TypeQuery;
   /** Start and end of the inserted old type text in the modified file. */
   span?: { start: number; end: number };
+  /** Start and end of the inserted new type text, for probes that insert both (component props). */
+  afterSpan?: { start: number; end: number };
 }
 
 interface Insertion {
@@ -56,6 +60,8 @@ interface Insertion {
   probe: Probe;
   /** Offset of the old type text inside `text`. */
   typeOffset: number;
+  /** Offset of the new type text inside `text`, when it is inserted too. */
+  afterOffset?: number;
 }
 
 /**
@@ -104,6 +110,10 @@ export function checkTypeQueries(root: string, queries: TypeQuery[]): Map<string
       result += text.slice(last, insertion.at);
       const start = result.length + insertion.typeOffset;
       insertion.probe.span = { start, end: start + insertion.probe.query.before.length };
+      if (insertion.afterOffset !== undefined) {
+        const afterStart = result.length + insertion.afterOffset;
+        insertion.probe.afterSpan = { start: afterStart, end: afterStart + insertion.probe.query.after.length };
+      }
       result += insertion.text;
       last = insertion.at;
     }
@@ -142,7 +152,8 @@ export function checkTypeQueries(root: string, queries: TypeQuery[]): Map<string
     // A probe that does not parse cleanly may have shifted the parse of the
     // rest of the file, so nothing in it can be trusted.
     const syntactic = program.getSyntacticDiagnostics(sourceFile);
-    if (probes.some((p) => syntactic.some((d) => inSpan(d, p.span!)))) continue;
+    const spans = (p: Probe) => (p.afterSpan ? [p.span!, p.afterSpan] : [p.span!]);
+    if (probes.some((p) => spans(p).some((span) => syntactic.some((d) => inSpan(d, span))))) continue;
     const semantic = program.getSemanticDiagnostics(sourceFile);
     const nodes = probeNodes(sourceFile);
 
@@ -151,7 +162,7 @@ export function checkTypeQueries(root: string, queries: TypeQuery[]): Map<string
       if (!node?.type || node.type.getStart() !== probe.span!.start || node.type.end !== probe.span!.end) continue;
       // Unresolved names and other errors in the old type (e.g. a type that no
       // longer exists): leave the decision to the text comparison.
-      if (semantic.some((d) => inSpan(d, probe.span!))) continue;
+      if (spans(probe).some((span) => semantic.some((d) => inSpan(d, span)))) continue;
       const oldType = checker.getTypeFromTypeNode(node.type);
       const newType = targetType(checker, node, probe.query);
       if (!newType) continue;
@@ -181,6 +192,7 @@ function planInsertion(sourceFile: ts.SourceFile, probe: Probe): Insertion | und
   if (!isTypeText(query.before)) return undefined;
   const decl = findNode(sourceFile, query.declaration);
   if (!decl) return undefined;
+  if (ts.isVariableDeclaration(decl) || ts.isExportAssignment(decl)) return componentInsertion(sourceFile, decl, probe);
   const name = `${PROBE}${probe.id}`;
   const param = (at: number, prefix: string, suffix: string): Insertion => ({
     at,
@@ -249,6 +261,51 @@ function aliasInsertion(sourceFile: ts.SourceFile, decl: ts.TypeAliasDeclaration
   };
 }
 
+/**
+ * For the props of a component typed as `FC<Props>` or wrapped in
+ * `memo`/`forwardRef`, which has no parameter of its own to put a probe next
+ * to: inserts both the old and the new props type as aliases in front of the
+ * statement that declares the component, so both resolve in its scope.
+ *
+ * ```ts
+ * type __semverGuardOld0 = { label: string };
+ * type __semverGuardNew0 = { label: string | number };
+ * export const Button = memo((props: { label: string | number }) => ...);
+ * ```
+ *
+ * Only the props (parameter 0) are checked; the ref of a `forwardRef`
+ * component is compared by its text.
+ */
+function componentInsertion(
+  sourceFile: ts.SourceFile,
+  decl: ts.VariableDeclaration | ts.ExportAssignment,
+  probe: Probe,
+): Insertion | undefined {
+  if (probe.query.position !== 0 || !isTypeText(probe.query.after)) return undefined;
+  let statement: ts.Node = decl;
+  while (!ts.isSourceFile(statement.parent) && !ts.isModuleBlock(statement.parent)) {
+    statement = statement.parent;
+    if (!statement.parent) return undefined;
+  }
+  const prefix = `type ${PROBE}${probe.id} = `;
+  const middle = `;\ntype ${NEW_PROBE}${probe.id} = `;
+  return {
+    at: statement.getStart(sourceFile),
+    text: `${prefix}${probe.query.before}${middle}${probe.query.after};\n`,
+    typeOffset: prefix.length,
+    afterOffset: prefix.length + probe.query.before.length + middle.length,
+    probe,
+  };
+}
+
+/** The new type inserted right after a component props probe. */
+function pairedNewType(probe: ts.TypeAliasDeclaration): ts.TypeAliasDeclaration | undefined {
+  const statements = (probe.parent as ts.SourceFile | ts.ModuleBlock).statements;
+  const next = statements[statements.indexOf(probe) + 1];
+  const expected = probe.name.text.replace(PROBE, NEW_PROBE);
+  return next && ts.isTypeAliasDeclaration(next) && next.name.text === expected ? next : undefined;
+}
+
 /** The identity test inserted after a type alias probe. */
 function identityProbe(probe: ProbeNode, id: number): ts.TypeAliasDeclaration | undefined {
   if (!ts.isTypeAliasDeclaration(probe)) return undefined;
@@ -263,6 +320,8 @@ function targetType(checker: ts.TypeChecker, probe: ProbeNode, query: TypeQuery)
     node ? checker.getTypeFromTypeNode(node) : declarationType(checker, decl);
 
   if (ts.isTypeAliasDeclaration(probe)) {
+    const paired = pairedNewType(probe);
+    if (paired) return checker.getTypeFromTypeNode(paired.type);
     // The old target alias, the identity test, then the new alias.
     const statements = (probe.parent as ts.SourceFile | ts.ModuleBlock).statements;
     const target = statements[statements.indexOf(probe) + 2];

@@ -91,6 +91,85 @@ describe('--baseline', () => {
   });
 });
 
+describe('wildcard baseline entries', () => {
+  const COMPONENT_BEFORE = {
+    'index.ts': `export interface Button {
+  onClick(): void;
+  onHover(): void;
+  label: string;
+}
+export function legacy() {}
+export function old() {}
+export namespace Utils { export function format() {} export function parse() {} }
+`,
+  };
+  const COMPONENT_AFTER = { 'index.ts': 'export interface Button {\n  label: number;\n}\nexport namespace Utils {}\n' };
+  const compareWith = (accepted: unknown[]) => {
+    const { code, stdout, stderr } = cli(
+      'compare',
+      '--from',
+      makeSnapshot(COMPONENT_BEFORE),
+      '--to',
+      makeSnapshot(COMPONENT_AFTER),
+      '--baseline',
+      baseline({ accepted }),
+      '--format',
+      'json',
+    );
+    const report = JSON.parse(stdout);
+    return { code, stderr, report, left: report.changes.map((c: { code: string; export: string; member?: string }) => `${c.code} ${c.export}${c.member ? `#${c.member}` : ''}`) };
+  };
+
+  it('a member glob suppresses every matching member change', () => {
+    const { left, report, stderr } = compareWith([{ code: 'member-removed', export: 'Button', member: 'on*' }]);
+    expect(stderr).toBe('');
+    expect(report.summary.accepted).toBe(2);
+    expect(left).toEqual([
+      'member-changed Button#label',
+      'export-removed Utils.format',
+      'export-removed Utils.parse',
+      'export-removed legacy',
+      'export-removed old',
+    ]);
+  });
+
+  it('a member glob that does not match suppresses nothing and is reported as unused', () => {
+    const { code, left, stderr } = compareWith([{ code: 'member-removed', export: 'Button', member: 'handle*' }]);
+    expect(code).toBe(1);
+    expect(left).toContain('member-removed Button#onClick');
+    expect(left).toContain('member-removed Button#onHover');
+    expect(stderr).toContain('baseline entry member-removed Button#handle* did not match any reported change');
+  });
+
+  it('globs do not cross the export/member boundary', () => {
+    // "Button*" must match the export name exactly up to the wildcard; it does
+    // not reach into members, and an entry without "member" never matches member changes.
+    const { left } = compareWith([{ code: 'member-removed', export: 'Button*' }]);
+    expect(left).toContain('member-removed Button#onClick');
+    const exact = compareWith([{ code: 'member-changed', export: '*', member: 'lab*' }]);
+    expect(exact.left).not.toContain('member-changed Button#label');
+  });
+
+  it('an export glob without a member suppresses removals of any export', () => {
+    const { code, left, report } = compareWith([{ code: 'export-removed', export: '*' }]);
+    expect(code).toBe(1);
+    expect(report.summary.accepted).toBe(4);
+    expect(left).toEqual(['member-changed Button#label', 'member-removed Button#onClick', 'member-removed Button#onHover']);
+  });
+
+  it('"*" matches dots, so a namespace prefix accepts its members', () => {
+    const { report, left } = compareWith([{ code: 'export-removed', export: 'Utils.*' }]);
+    expect(report.summary.accepted).toBe(2);
+    expect(left).not.toContain('export-removed Utils.format');
+    expect(left).toContain('export-removed legacy');
+  });
+
+  it('treats other glob characters literally', () => {
+    const { left } = compareWith([{ code: 'export-removed', export: 'ol?' }]);
+    expect(left).toContain('export-removed old');
+  });
+});
+
 describe('invalid baseline files exit 2', () => {
   it.each([
     ['{ not json', 'is not valid JSON'],
@@ -103,6 +182,10 @@ describe('invalid baseline files exit 2', () => {
     [{ accepted: [{ code: 'export-removed' }] }, 'accepted[0].export must be a non-empty string'],
     [{ accepted: [{ code: 'member-removed', export: 'C', member: 3 }] }, 'accepted[0].member must be a string'],
     [{ accepted: [{ code: 'export-removed', export: 'f', memebr: 'x' }] }, 'accepted[0] has unknown field "memebr"'],
+    [{ accepted: [{ code: 'export-removed', export: 'f', exportGlob: '*' }] }, 'accepted[0] has unknown field "exportGlob"'],
+    [{ accepted: [{ code: 'export-removed', export: 'Utils.**' }] }, 'accepted[0].export "Utils.**" is not a valid pattern'],
+    [{ accepted: [{ code: 'member-removed', export: 'C', member: 'on**' }] }, 'accepted[0].member "on**" is not a valid pattern'],
+    [{ accepted: [{ code: 'export-removed', export: 'f', file: 'src/*.ts' }] }, 'wildcards are only supported in "export" and "member"'],
   ])('%j', (contents, message) => {
     const { code, stdout, stderr } = cli('compare', '--from', BEFORE, '--to', AFTER, '--baseline', baseline(contents));
     expect(code).toBe(2);

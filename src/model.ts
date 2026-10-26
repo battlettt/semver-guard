@@ -68,6 +68,15 @@ export interface Member {
 export interface FunctionShape {
   kind: 'function';
   signatures: Signature[];
+  /**
+   * Set for a React component that is not a plain function: a variable
+   * annotated as `FC<Props>`/`FunctionComponent<Props>`, or a `memo(...)` or
+   * `forwardRef(...)` call. Describes the form, e.g. `React.FC`, `memo` or
+   * `memo(forwardRef)`. Its single signature lists the props (and, for
+   * `forwardRef`, the optional ref) as parameters; its return type is empty
+   * and not compared.
+   */
+  component?: string;
 }
 
 export interface ClassShape {
